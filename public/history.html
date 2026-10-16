@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Historique des incidents</title>
+  <link rel="icon" href="/favicon.svg">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="wrap">
+    <header class="pub-header">
+      <div class="brand"><div><h1>Historique des incidents</h1><p>Les 100 derniers incidents et maintenances</p></div></div>
+      <a class="btn sm" href="/">← Retour</a>
+    </header>
+    <div id="list"><p class="muted">Chargement…</p></div>
+    <footer class="pub-footer"><a href="/">Page de status</a></footer>
+  </div>
+  <script src="/common.js"></script>
+  <script>
+    api('/api/incidents/history').then((list) => {
+      if (!list.length) { $('#list').innerHTML = '<div class="card" style="padding:20px"><span class="muted">Aucun incident enregistré.</span></div>'; return; }
+      const byMonth = {};
+      for (const i of list) (byMonth[new Date(i.createdAt).toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' })] ||= []).push(i);
+      $('#list').innerHTML = Object.entries(byMonth).map(([mo, items]) => `<div class="section-title">${esc(mo)}</div>` + items.map((i) => {
+        const res = i.status === 'resolved';
+        return `<div class="card incident ${res ? 'resolved' : esc(i.severity)}">
+          <h3>${esc(i.title)} <span class="pill ${res ? 's1' : 's2'}">${esc(INC_STATUS[i.status] || i.status)}</span> <span class="pill s-1">${esc(SEV_LABEL[i.severity] || '')}</span></h3>
+          <div class="when">${fmtDate(i.createdAt)}${i.resolvedAt ? ' → ' + fmtDate(i.resolvedAt) : ''}</div>
+          ${(i.updates || []).slice().reverse().map((u) => `<div class="upd"><b>${esc(INC_STATUS[u.status] || u.status)}</b> — <span class="when">${fmtDate(u.at)}</span><p>${esc(u.text)}</p></div>`).join('')}
+        </div>`;
+      }).join('')).join('');
+    }).catch(() => { $('#list').innerHTML = '<p class="muted">Erreur de chargement.</p>'; });
+  </script>
+</body>
+</html>

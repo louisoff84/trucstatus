@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Status</title>
+  <link rel="icon" href="/favicon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="wrap">
+    <header class="pub-header">
+      <div class="brand">
+        <img id="logo" class="hidden" alt="">
+        <div>
+          <h1 id="title">Status</h1>
+          <p id="desc"></p>
+        </div>
+      </div>
+      <a class="btn sm ghost muted" href="/history">Historique</a>
+    </header>
+
+    <div id="overall" class="overall empty"><div class="ic">…</div><div>Chargement…</div></div>
+    <div id="incidents"></div>
+    <div id="groups"></div>
+    <div id="past"></div>
+
+    <footer class="pub-footer">
+      <div id="updated">—</div>
+      <div id="footer-text" style="margin-top:6px"></div>
+      <div style="margin-top:10px"><a href="/admin">Administration</a></div>
+    </footer>
+  </div>
+  <script src="/common.js"></script>
+  <script src="/status.js"></script>
+</body>
+</html>

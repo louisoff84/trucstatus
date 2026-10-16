@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Administration · Status</title>
+  <link rel="icon" href="/favicon.svg">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <!-- Connexion / première configuration -->
+  <div id="auth" class="auth hidden">
+    <form class="card" id="auth-form">
+      <h1 id="auth-title">Connexion</h1>
+      <p class="muted small" id="auth-sub" style="margin:0 0 20px">Accède au tableau de bord.</p>
+      <div class="field"><label>Mot de passe administrateur</label><input type="password" id="auth-pw" autocomplete="current-password" required></div>
+      <div class="field hidden" id="auth-pw2-wrap"><label>Confirmer le mot de passe</label><input type="password" id="auth-pw2" autocomplete="new-password"></div>
+      <button class="btn primary" style="width:100%;justify-content:center" type="submit">Continuer</button>
+      <p class="small" style="text-align:center;margin:16px 0 0"><a class="muted" href="/">← Page publique</a></p>
+    </form>
+  </div>
+
+  <div id="app" class="hidden">
+    <header class="topbar">
+      <a class="logo" href="/admin"><span class="dot s1"></span> <span id="app-title">Status</span></a>
+      <nav>
+        <a class="btn ghost sm" href="/" target="_blank">Page publique ↗</a>
+        <button class="btn ghost sm" data-open="incidents">Incidents</button>
+        <button class="btn ghost sm" data-open="notifications">Notifications</button>
+        <button class="btn ghost sm" data-open="settings">Paramètres</button>
+        <button class="btn ghost sm" id="logout">Déconnexion</button>
+      </nav>
+    </header>
+
+    <div class="layout">
+      <aside class="card side">
+        <div class="side-tools">
+          <button class="btn primary" id="add-monitor">＋ Ajouter</button>
+          <input id="search" placeholder="Rechercher…">
+        </div>
+        <div class="mlist" id="mlist"></div>
+      </aside>
+      <main class="main" id="main"></main>
+    </div>
+  </div>
+
+  <div id="modal-root"></div>
+  <script src="/common.js"></script>
+  <script src="/admin.js"></script>
+</body>
+</html>
