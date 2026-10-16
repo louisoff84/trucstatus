@@ -44,18 +44,46 @@ function isHttps(req) {
 function hashPassword(pw, salt) {
   return crypto.scryptSync(pw, salt, 64).toString('hex');
 }
-function checkPassword(pw) {
-  const s = db.data.settings;
-  if (!s.adminHash) return false;
-  const h = Buffer.from(hashPassword(pw, s.salt), 'hex');
-  const ref = Buffer.from(s.adminHash, 'hex');
+// ── Utilisateurs : rôles lecteur < éditeur < admin ──
+const ROLES = { viewer: 1, editor: 2, admin: 3 };
+db.data.users ||= [];
+if (!db.data.users.length && db.data.settings.adminHash) {
+  // migration : l'ancien mot de passe unique devient l'utilisateur « admin »
+  db.data.users.push({ id: db.nextId(), username: 'admin', hash: db.data.settings.adminHash, salt: db.data.settings.salt, role: 'admin', createdAt: new Date().toISOString() });
+  delete db.data.settings.adminHash; delete db.data.settings.salt;
+  db.save();
+}
+const needsSetup = () => !db.data.users.length;
+// ── Journal d'activité (1 000 dernières actions) ──
+db.data.audit ||= [];
+function audit(req, action, target = '', who) {
+  const u = req._user;
+  db.data.audit.push({ t: Date.now(), user: who || (u ? u.username : 'anonyme'), action, target: String(target || '').slice(0, 120), ip: clientIp(req) });
+  if (db.data.audit.length > 1000) db.data.audit.splice(0, db.data.audit.length - 1000);
+  db.save();
+}
+const findUser = (name) => db.data.users.find((u) => u.username.toLowerCase() === String(name || '').toLowerCase());
+function verifyPassword(user, pw) {
+  if (!user) { hashPassword(String(pw), 'x'.repeat(32)); return false; } // temps constant
+  const h = Buffer.from(hashPassword(String(pw), user.salt), 'hex');
+  const ref = Buffer.from(user.hash, 'hex');
   return h.length === ref.length && crypto.timingSafeEqual(h, ref);
 }
-function setPassword(pw) {
-  const salt = crypto.randomBytes(16).toString('hex');
-  db.data.settings.salt = salt;
-  db.data.settings.adminHash = hashPassword(pw, salt);
+function setUserPassword(user, pw) {
+  user.salt = crypto.randomBytes(16).toString('hex');
+  user.hash = hashPassword(String(pw), user.salt);
   db.save();
+}
+const publicUser = (u) => ({ id: u.id, username: u.username, role: u.role, createdAt: u.createdAt, lastLogin: u.lastLogin || null });
+// ── Clés API : « Authorization: Bearer cs_… » ──
+db.data.apiKeys ||= [];
+function apiKeyUser(req) {
+  const m = String(req.headers.authorization || '').match(/^Bearer\s+(cs_[A-Za-z0-9]{20,})$/);
+  if (!m) return null;
+  const k = db.data.apiKeys.find((x) => x.hash === sha(m[1]));
+  if (!k) return null;
+  k.lastUsed = new Date().toISOString();
+  return { id: 'key' + k.id, username: `clé « ${k.name} »`, role: k.role, api: true };
 }
 function parseCookies(req) {
   const out = {};
@@ -65,16 +93,24 @@ function parseCookies(req) {
   });
   return out;
 }
+// Renvoie l'utilisateur connecté (session ou clé API), sinon null
 function isAuthed(req) {
-  const t = parseCookies(req).cs_session;
-  const exp = t && sessions.get(t);
-  if (!exp) return false;
-  if (exp < Date.now()) { sessions.delete(t); return false; }
-  return true;
+  if (req._user !== undefined) return req._user;
+  let user = apiKeyUser(req);
+  if (!user) {
+    const t = parseCookies(req).cs_session;
+    let v = t && sessions.get(t);
+    if (typeof v === 'number') v = { exp: v, uid: (db.data.users.find((u) => u.role === 'admin') || {}).id }; // anciennes sessions
+    if (v && v.exp < Date.now()) { sessions.delete(t); v = null; }
+    user = v ? db.data.users.find((u) => u.id === v.uid) || null : null;
+  }
+  req._user = user;
+  return user;
 }
-function newSession(req, res) {
+function newSession(req, res, user) {
   const t = crypto.randomBytes(32).toString('hex');
-  sessions.set(t, Date.now() + SESSION_MS);
+  sessions.set(t, { exp: Date.now() + SESSION_MS, uid: user.id });
+  user.lastLogin = new Date().toISOString();
   res.setHeader('Set-Cookie', `cs_session=${t}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_MS / 1000}${isHttps(req) ? '; Secure' : ''}`);
 }
 
@@ -92,7 +128,7 @@ function readBody(req) {
     req.on('error', reject);
   });
 }
-const clamp = (v, min, max, def) => { const n = Number(v); return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def; };
+const clamp = (v, min, max, def) => { if (v == null || v === '') return def; const n = Number(v); return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def; };
 const str = (v, max = 500) => (v == null ? '' : String(v).slice(0, max));
 
 const MONITOR_TYPES = ['http', 'keyword', 'json', 'tcp', 'ping', 'dns', 'push', 'minecraft', 'proxmox', 'database'];
@@ -348,6 +384,49 @@ function broadcastRefresh() {
 setInterval(() => { for (const c of clients) c.res.write(': ping\n\n'); }, 25000);
 
 // ───────────────────────── Routeur ─────────────────────────
+// Rôle requis : route explicite, sinon admin pour les zones sensibles, éditeur pour les modifications, lecteur pour la lecture
+const ROLE_LABEL = { viewer: 'lecteur', editor: 'éditeur', admin: 'administrateur' };
+const ADMIN_ONLY = [/^\/api\/settings/, /^\/api\/notifications/, /^\/api\/backups/, /^\/api\/export/, /^\/api\/import/, /^\/api\/users/, /^\/api\/apikeys/, /^\/api\/audit/, /^\/api\/discord-live/, /^\/api\/report/, /^\/api\/pages/];
+function requiredRole(r, method, path) {
+  if (typeof r.auth === 'string') return r.auth;
+  if (ADMIN_ONLY.some((re) => re.test(path)) && !(method === 'GET' && path === '/api/notifications')) return 'admin';
+  return method === 'GET' ? 'viewer' : 'editor';
+}
+// Libellés du journal pour les actions de modification
+const AUDIT_ACTIONS = [
+  ['POST', /^\/api\/monitors$/, 'Monitor créé', 'monitors'],
+  ['PUT', /^\/api\/monitors\/\d+$/, 'Monitor modifié', 'monitors'],
+  ['DELETE', /^\/api\/monitors\/\d+$/, 'Monitor supprimé', 'monitors'],
+  ['POST', /^\/api\/monitors\/\d+\/toggle$/, 'Monitor mis en pause / repris', 'monitors', true],
+  ['POST', /^\/api\/monitors\/\d+\/snooze$/, 'Silence des alertes modifié', 'monitors'],
+  ['POST', /^\/api\/incidents$/, 'Incident publié', 'incidents'],
+  ['PUT', /^\/api\/incidents\/\d+$/, 'Incident mis à jour', 'incidents'],
+  ['DELETE', /^\/api\/incidents\/\d+$/, 'Incident supprimé', 'incidents'],
+  ['POST', /^\/api\/pages$/, 'Page créée', 'pages'],
+  ['PUT', /^\/api\/pages\/\d+$/, 'Page modifiée', 'pages'],
+  ['DELETE', /^\/api\/pages\/\d+$/, 'Page supprimée', 'pages'],
+  ['POST', /^\/api\/notifications$/, 'Notification créée', 'notifications'],
+  ['PUT', /^\/api\/notifications\/\d+$/, 'Notification modifiée', 'notifications'],
+  ['DELETE', /^\/api\/notifications\/\d+$/, 'Notification supprimée', 'notifications'],
+  ['PUT', /^\/api\/settings$/, 'Paramètres modifiés', null],
+  ['POST', /^\/api\/users$/, 'Utilisateur créé', 'users'],
+  ['PUT', /^\/api\/users\/\d+$/, 'Utilisateur modifié', 'users'],
+  ['DELETE', /^\/api\/users\/\d+$/, 'Utilisateur supprimé', 'users'],
+  ['POST', /^\/api\/apikeys$/, 'Clé API créée', 'apiKeys'],
+  ['DELETE', /^\/api\/apikeys\/\d+$/, 'Clé API révoquée', 'apiKeys'],
+  ['POST', /^\/api\/import$/, 'Configuration importée', null],
+  ['POST', /^\/api\/backups$/, 'Sauvegarde créée', null],
+  ['POST', /^\/api\/report\/send$/, 'Rapport hebdomadaire envoyé', null],
+];
+function auditAction(method, path) {
+  const a = AUDIT_ACTIONS.find(([m, re]) => m === method && re.test(path));
+  return a ? { label: a[2], kind: a[3], toggle: !!a[4] } : null;
+}
+function targetName(kind, id) {
+  const x = kind && (db.data[kind] || []).find((i) => i.id === id);
+  return x ? x.name || x.title || x.username || x.slug || '' : '';
+}
+
 const routes = [];
 const route = (method, pattern, handler, auth = false) => {
   const keys = [];
@@ -372,7 +451,7 @@ function buildStatus(page) {
     : { title: s.title, description: s.description, logoUrl: s.logoUrl || '', footer: s.footer || '' };
   Object.assign(meta, { accentColor: s.accentColor || '', banner: s.banner && s.banner.text ? s.banner : null, customCss: s.customCss || '' });
   const base = (s.publicUrl || '').replace(/\/+$/, '');
-  return { ...meta, monitors, incidents, setup: !s.adminHash, url: base ? base + (page ? '/s/' + page.slug : '/') : '' };
+  return { ...meta, monitors, incidents, setup: needsSetup(), url: base ? base + (page ? '/s/' + page.slug : '/') : '' };
 }
 route('GET', '/api/status', (req, res, p, q) => {
   const r = resolvePage(req, res, q);
@@ -496,13 +575,21 @@ route('GET', '/api/feed.xml', (req, res) => {
 });
 
 // Auth
-route('GET', '/api/me', (req, res) => send(res, 200, { authed: isAuthed(req), setup: !db.data.settings.adminHash }));
+route('GET', '/api/me', (req, res) => {
+  const u = isAuthed(req);
+  send(res, 200, { authed: !!u, setup: needsSetup(), user: u ? { username: u.username, role: u.role } : null });
+});
 route('POST', '/api/setup', async (req, res) => {
-  if (db.data.settings.adminHash) return send(res, 400, { error: 'Déjà configuré' });
+  if (!needsSetup()) return send(res, 400, { error: 'Déjà configuré' });
   const b = await readBody(req);
   if (!b.password || String(b.password).length < 8) return send(res, 400, { error: 'Mot de passe : 8 caractères minimum' });
-  setPassword(String(b.password));
-  newSession(req, res);
+  const username = str(b.username, 40).trim() || 'admin';
+  if (!/^[\w.@-]{2,40}$/.test(username)) return send(res, 400, { error: 'Identifiant : lettres, chiffres, . _ - @ (2 à 40)' });
+  const user = { id: db.nextId(), username, role: 'admin', createdAt: new Date().toISOString() };
+  setUserPassword(user, b.password);
+  db.data.users.push(user);
+  newSession(req, res, user);
+  req._user = user; audit(req, 'Compte administrateur créé', username);
   send(res, 200, { ok: true });
 });
 route('POST', '/api/login', async (req, res) => {
@@ -510,15 +597,18 @@ route('POST', '/api/login', async (req, res) => {
   const a = loginAttempts.get(ip) || { n: 0, until: 0 };
   if (a.until > Date.now()) return send(res, 429, { error: 'Trop de tentatives, réessaie dans quelques minutes' });
   const b = await readBody(req);
-  if (!checkPassword(String(b.password || ''))) {
+  const user = findUser(b.username || 'admin');
+  if (!verifyPassword(user, b.password || '')) {
     a.n++;
     if (a.n >= 5) { a.until = Date.now() + 5 * 60000; a.n = 0; }
     loginAttempts.set(ip, a);
-    return send(res, 401, { error: 'Mot de passe incorrect' });
+    audit(req, 'Échec de connexion', String(b.username || 'admin').slice(0, 40), 'système');
+    return send(res, 401, { error: 'Identifiant ou mot de passe incorrect' });
   }
   loginAttempts.delete(ip);
-  newSession(req, res);
-  send(res, 200, { ok: true });
+  newSession(req, res, user);
+  req._user = user; audit(req, 'Connexion');
+  send(res, 200, { ok: true, user: { username: user.username, role: user.role } });
 });
 route('POST', '/api/logout', (req, res) => {
   sessions.delete(parseCookies(req).cs_session);
@@ -569,6 +659,95 @@ route('GET', '/api/monitors/:id/beats', (req, res, p, q) => {
   const since = Date.now() - hours * 3600 * 1000;
   send(res, 200, (db.data.beats[Number(p.id)] || []).filter((b) => b.t >= since));
 }, true);
+// Silence des alertes (les vérifications continuent)
+route('POST', '/api/monitors/:id/snooze', async (req, res, p) => {
+  const m = db.data.monitors.find((x) => x.id === Number(p.id));
+  if (!m) return send(res, 404, { error: 'Introuvable' });
+  const b = await readBody(req);
+  const minutes = clamp(b.minutes, 0, 30 * 24 * 60, 0);
+  m.snoozeUntil = minutes > 0 ? Date.now() + minutes * 60000 : null;
+  db.save();
+  send(res, 200, monitorSummary(m, true));
+}, true);
+// Export CSV de l'historique (séparateur « ; » pour Excel en français)
+route('GET', '/api/monitors/:id/export.csv', (req, res, p, q) => {
+  const m = db.data.monitors.find((x) => x.id === Number(p.id));
+  if (!m) return send(res, 404, { error: 'Introuvable' });
+  const days = clamp(q.get('days'), 1, 7, 7);
+  const since = Date.now() - days * 86400000;
+  const cell = (v) => (v == null ? '' : /[;"\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
+  const LBL = { 0: 'Hors ligne', 1: 'En ligne', 2: 'En attente', 3: 'Maintenance', 4: 'Dégradé' };
+  const rows = (db.data.beats[m.id] || []).filter((b) => b.t >= since)
+    .map((b) => [new Date(b.t).toISOString(), LBL[b.s], b.p, b.pl, b.m].map(cell).join(';'));
+  const fname = `${m.name.normalize('NFD').replace(/[^\w-]+/g, '_').slice(0, 40)}-${db.dayKey(Date.now())}.csv`;
+  res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${fname}"` });
+  res.end('\ufeff' + ['date;statut;ping_ms;joueurs;message', ...rows].join('\r\n'));
+}, true);
+
+// Utilisateurs (admin)
+const USERNAME_RE = /^[\w.@-]{2,40}$/;
+const adminCount = () => db.data.users.filter((u) => u.role === 'admin').length;
+route('GET', '/api/users', (req, res) => send(res, 200, { me: isAuthed(req).id, users: db.data.users.map(publicUser) }), true);
+route('POST', '/api/users', async (req, res) => {
+  const b = await readBody(req);
+  const username = str(b.username, 40).trim();
+  if (!USERNAME_RE.test(username)) return send(res, 400, { error: 'Identifiant : lettres, chiffres, . _ - @ (2 à 40)' });
+  if (findUser(username)) return send(res, 400, { error: 'Cet identifiant existe déjà' });
+  if (String(b.password || '').length < 8) return send(res, 400, { error: 'Mot de passe : 8 caractères minimum' });
+  const user = { id: db.nextId(), username, role: ROLES[b.role] ? b.role : 'viewer', createdAt: new Date().toISOString() };
+  setUserPassword(user, b.password);
+  db.data.users.push(user);
+  send(res, 200, publicUser(user));
+}, true);
+route('PUT', '/api/users/:id', async (req, res, p) => {
+  const u = db.data.users.find((x) => x.id === Number(p.id));
+  if (!u) return send(res, 404, { error: 'Introuvable' });
+  const b = await readBody(req);
+  if (b.role && ROLES[b.role] && b.role !== u.role) {
+    if (u.role === 'admin' && adminCount() === 1) return send(res, 400, { error: 'Impossible : il doit rester au moins un administrateur' });
+    u.role = b.role;
+  }
+  if (b.password) {
+    if (String(b.password).length < 8) return send(res, 400, { error: 'Mot de passe : 8 caractères minimum' });
+    setUserPassword(u, b.password);
+    if (u.id !== isAuthed(req).id) for (const [k, v] of Object.entries(db.data.sessions)) if (v && v.uid === u.id) delete db.data.sessions[k];
+  }
+  db.save();
+  send(res, 200, publicUser(u));
+}, true);
+route('DELETE', '/api/users/:id', (req, res, p) => {
+  const id = Number(p.id);
+  const u = db.data.users.find((x) => x.id === id);
+  if (!u) return send(res, 404, { error: 'Introuvable' });
+  if (id === isAuthed(req).id) return send(res, 400, { error: 'Tu ne peux pas supprimer ton propre compte' });
+  if (u.role === 'admin' && adminCount() === 1) return send(res, 400, { error: 'Impossible : il doit rester au moins un administrateur' });
+  db.data.users = db.data.users.filter((x) => x.id !== id);
+  for (const [k, v] of Object.entries(db.data.sessions)) if (v && v.uid === id) delete db.data.sessions[k];
+  db.save();
+  send(res, 200, { ok: true });
+}, true);
+
+// Clés API (admin) — la clé n'est affichée qu'une seule fois
+route('GET', '/api/apikeys', (req, res) => send(res, 200, db.data.apiKeys.map(({ id, name, prefix, role, createdAt, lastUsed }) => ({ id, name, prefix, role, createdAt, lastUsed }))), true);
+route('POST', '/api/apikeys', async (req, res) => {
+  const b = await readBody(req);
+  const name = str(b.name, 60).trim() || 'Clé API';
+  const key = 'cs_' + crypto.randomBytes(24).toString('hex');
+  const k = { id: db.nextId(), name, prefix: key.slice(0, 10), hash: sha(key), role: ROLES[b.role] ? b.role : 'viewer', createdAt: new Date().toISOString(), lastUsed: null };
+  db.data.apiKeys.push(k); db.save();
+  send(res, 200, { id: k.id, name, role: k.role, key });
+}, true);
+route('DELETE', '/api/apikeys/:id', (req, res, p) => {
+  db.data.apiKeys = db.data.apiKeys.filter((k) => k.id !== Number(p.id)); db.save();
+  send(res, 200, { ok: true });
+}, true);
+
+// Journal d'activité (admin)
+route('GET', '/api/audit', (req, res, p, q) => {
+  const limit = clamp(q.get('limit'), 1, 1000, 200);
+  send(res, 200, db.data.audit.slice(-limit).reverse());
+}, true);
+
 route('POST', '/api/monitors/test', async (req, res) => {
   const m = sanitizeMonitor(await readBody(req));
   if (m.type === 'push') return send(res, 200, { ok: false, msg: 'Un monitor push ne peut pas être testé : il attend les appels de ton service.' });
@@ -641,7 +820,10 @@ function sanitizeNotif(b, existing = {}) {
       smtpHost: str(c.smtpHost, 200), smtpPort: str(c.smtpPort, 6), smtpSecure: !!c.smtpSecure, smtpUser: str(c.smtpUser, 200), smtpPass: str(c.smtpPass, 200), mailFrom: str(c.mailFrom, 200), mailTo: str(c.mailTo, 1000) },
   };
 }
-route('GET', '/api/notifications', (req, res) => send(res, 200, db.data.notifications), true);
+route('GET', '/api/notifications', (req, res) => {
+  const admin = isAuthed(req).role === 'admin';
+  send(res, 200, admin ? db.data.notifications : db.data.notifications.map(({ id, name, type, applyAll, active }) => ({ id, name, type, applyAll, active })));
+}, true);
 route('POST', '/api/notifications', async (req, res) => {
   const n = sanitizeNotif(await readBody(req));
   n.id = db.nextId();
@@ -740,11 +922,12 @@ route('PUT', '/api/settings', async (req, res) => {
     };
   }
   if (b.newPassword) {
-    if (!checkPassword(String(b.currentPassword || ''))) return send(res, 400, { error: 'Mot de passe actuel incorrect' });
+    const me = isAuthed(req);
+    if (!me || me.api || !verifyPassword(me, b.currentPassword || '')) return send(res, 400, { error: 'Mot de passe actuel incorrect' });
     if (String(b.newPassword).length < 8) return send(res, 400, { error: 'Nouveau mot de passe : 8 caractères minimum' });
-    setPassword(String(b.newPassword));
-    sessions.clear();
-    newSession(req, res);
+    setUserPassword(me, b.newPassword);
+    for (const [k, v] of Object.entries(db.data.sessions)) if (v && v.uid === me.id) delete db.data.sessions[k];
+    newSession(req, res, me);
   }
   db.save(); broadcastRefresh();
   send(res, 200, { ok: true });
@@ -862,15 +1045,32 @@ const server = http.createServer(async (req, res) => {
       if (r.method !== req.method) continue;
       const match = url.pathname.match(r.re);
       if (!match) continue;
-      if (r.auth && !isAuthed(req)) return send(res, 401, { error: 'Non authentifié' });
+      if (r.auth) {
+        const user = isAuthed(req);
+        if (!user) return send(res, 401, { error: 'Non authentifié' });
+        const need = requiredRole(r, req.method, url.pathname);
+        if (ROLES[user.role] < ROLES[need]) return send(res, 403, { error: `Droits insuffisants : rôle « ${ROLE_LABEL[need]} » requis` });
+      }
       // Protection CSRF basique : les mutations doivent venir d'un fetch JSON
-      if (req.method !== 'GET' && !String(req.headers['content-type'] || '').includes('application/json') && url.pathname !== '/api/logout' && !url.pathname.startsWith('/api/push/')) {
+      // (DELETE et appels par clé API exemptés : impossibles depuis un formulaire tiers / sans cookie)
+      const bearer = /^Bearer\s/i.test(String(req.headers.authorization || ''));
+      if (req.method !== 'GET' && req.method !== 'DELETE' && !bearer && !String(req.headers['content-type'] || '').includes('application/json') && url.pathname !== '/api/logout' && !url.pathname.startsWith('/api/push/')) {
         return send(res, 415, { error: 'Content-Type application/json requis' });
       }
       const params = {};
       r.keys.forEach((k, i) => (params[k] = decodeURIComponent(match[i + 1])));
-      try { return await r.handler(req, res, params, url.searchParams); }
+      const act = req.method !== 'GET' && r.auth ? auditAction(req.method, url.pathname) : null;
+      const before = act && params.id ? targetName(act.kind, Number(params.id)) : '';
+      try { await r.handler(req, res, params, url.searchParams); }
       catch (e) { return send(res, 400, { error: e.message }); }
+      if (act && res.statusCode < 400) {
+        let target = before;
+        if (!target && act.kind) { const list = db.data[act.kind] || []; const last = list.reduce((a, b) => (!a || b.id > a.id ? b : a), null); target = last ? last.name || last.title || last.username || last.slug || '' : ''; }
+        let label = act.label;
+        if (act.toggle) { const m = db.data.monitors.find((x) => x.id === Number(params.id)); label = m && m.active ? 'Monitor repris' : 'Monitor mis en pause'; }
+        audit(req, label, target);
+      }
+      return;
     }
     return send(res, 404, { error: 'Route inconnue' });
   }

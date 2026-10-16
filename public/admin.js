@@ -24,7 +24,7 @@ async function init() {
   $('#auth').classList.remove('hidden');
   if (me.setup) {
     $('#auth-title').textContent = 'Bienvenue 👋';
-    $('#auth-sub').textContent = 'Crée le mot de passe administrateur (8 caractères minimum).';
+    $('#auth-sub').textContent = 'Crée le compte administrateur (mot de passe : 8 caractères minimum).';
     $('#auth-pw2-wrap').classList.remove('hidden');
     $('#auth-pw').autocomplete = 'new-password';
   }
@@ -34,9 +34,9 @@ async function init() {
     try {
       if (me.setup) {
         if (pw !== $('#auth-pw2').value) return toast('Les mots de passe ne correspondent pas', true);
-        await api('/api/setup', { method: 'POST', body: { password: pw } });
+        await api('/api/setup', { method: 'POST', body: { username: $('#auth-user').value.trim(), password: pw } });
       } else {
-        await api('/api/login', { method: 'POST', body: { password: pw } });
+        await api('/api/login', { method: 'POST', body: { username: $('#auth-user').value.trim(), password: pw } });
       }
       $('#auth').classList.add('hidden');
       startApp();
@@ -44,7 +44,14 @@ async function init() {
   };
 }
 
+let ME = { username: '', role: 'viewer' };
+const can = (role) => ({ viewer: 1, editor: 2, admin: 3 }[ME.role] >= { viewer: 1, editor: 2, admin: 3 }[role]);
+const ROLE_FR = { viewer: 'Lecteur', editor: 'Éditeur', admin: 'Administrateur' };
 async function startApp() {
+  const me = await api('/api/me');
+  ME = me.user || ME;
+  document.body.classList.add('role-' + ME.role);
+  $('#me-chip').textContent = `👤 ${ME.username} · ${ROLE_FR[ME.role]}`;
   $('#app').classList.remove('hidden');
   const s = await api('/api/settings').catch(() => ({ title: 'Status' }));
   $('#app-title').textContent = s.title;
@@ -78,7 +85,7 @@ async function startApp() {
 $('#logout').onclick =async () => { await api('/api/logout', { method: 'POST' }); location.reload(); };
 $('#add-monitor').onclick = () => openMonitorForm();
 $('#search').oninput = renderList;
-$$('[data-open]').forEach((b) => (b.onclick = () => ({ incidents: openIncidents, notifications: openNotifications, settings: openSettings, pages: openPages })[b.dataset.open]()));
+$$('[data-open]').forEach((b) => (b.onclick = () => ({ incidents: openIncidents, notifications: openNotifications, settings: openSettings, pages: openPages, users: openUsers, audit: openAudit })[b.dataset.open]()));
 window.addEventListener('hashchange', () => {
   const m = location.hash.match(/^#m-(\d+)/);
   selectedId = m ? Number(m[1]) : null;
@@ -164,7 +171,7 @@ function renderDashboard() {
           <td><span class="pill s${m.status}">${STATUS_LABEL[m.status]}</span></td>
           <td>${fmtMs(m.ping)}</td><td>${fmtPct(m.uptime24)}</td><td>${fmtPct(m.uptime30)}</td>
           <td><div class="bars mini">${beatBarsHTML(m.recent, 30)}</div></td></tr>`).join('')}</tbody>
-      </table></div>` : `<div class="empty"><div class="big">🚀</div>Ajoute ton premier monitor pour commencer la surveillance.<br><br><button class="btn primary" onclick="openMonitorForm()">＋ Ajouter un monitor</button></div>`}
+      </table></div>` : `<div class="empty"><div class="big">🚀</div>Ajoute ton premier monitor pour commencer la surveillance.<br><br><button class="btn primary need-editor" onclick="openMonitorForm()">＋ Ajouter un monitor</button></div>`}
     </div>
     <div class="card panel">
       <div class="panel-head"><h3>Dernières pannes détectées</h3></div>
@@ -189,12 +196,19 @@ function renderDetail(full = true) {
             <span class="muted small"> · ${esc(TYPE_LABEL[m.type])} · ${m.type === 'push' ? 'push attendu' : ''} toutes les ${m.config.interval} s</span></div>
           ${m.lastMsg ? `<div class="muted small" style="margin-top:4px">Dernier résultat : ${esc(m.lastMsg)}</div>` : ''}
           ${depsHTML(m)}
+          ${m.config.snoozeUntil > Date.now() ? `<div class="small" style="margin-top:6px;color:var(--pending)">🔕 Alertes en silence jusqu'au ${fmtDate(m.config.snoozeUntil)} — la surveillance continue.</div>` : ''}
         </div>
         <div class="actions">
-          <button class="btn" id="d-toggle">${m.config.active ? '⏸ Pause' : '▶ Reprendre'}</button>
-          <button class="btn" id="d-edit">✏️ Modifier</button>
-          <button class="btn" id="d-clone">⧉ Dupliquer</button>
-          <button class="btn danger" id="d-del">Supprimer</button>
+          <button class="btn need-editor" id="d-toggle">${m.config.active ? '⏸ Pause' : '▶ Reprendre'}</button>
+          <select class="btn need-editor" id="d-snooze" title="Couper les alertes sans arrêter la surveillance" style="width:auto">
+            <option value="">${m.config.snoozeUntil > Date.now() ? '🔕 En silence' : '🔔 Alertes actives'}</option>
+            <option value="60">🔕 Silence 1 h</option><option value="240">🔕 Silence 4 h</option><option value="1440">🔕 Silence 24 h</option><option value="10080">🔕 Silence 7 jours</option>
+            ${m.config.snoozeUntil > Date.now() ? '<option value="0">🔔 Réactiver les alertes</option>' : ''}
+          </select>
+          <button class="btn need-editor" id="d-edit">✏️ Modifier</button>
+          <button class="btn need-editor" id="d-clone">⧉ Dupliquer</button>
+          <a class="btn" href="/api/monitors/${m.id}/export.csv?days=7" title="Historique des 7 derniers jours">⬇ CSV</a>
+          <button class="btn danger need-editor" id="d-del">Supprimer</button>
         </div>
       </div>
       <div class="bars" style="margin-top:20px;height:30px">${beatBarsHTML(m.recent, 60)}</div>
@@ -309,6 +323,12 @@ function extraInfoHTML(m) {
 function bindDetail(m) {
   $('#d-toggle').onclick = async () => { await api(`/api/monitors/${m.id}/toggle`, { method: 'POST' }); loadMonitors(); };
   $('#d-edit').onclick = () => openMonitorForm(m.config);
+  $('#d-snooze').onchange = async (e) => {
+    if (e.target.value === '') return;
+    await api(`/api/monitors/${m.id}/snooze`, { method: 'POST', body: { minutes: Number(e.target.value) } });
+    toast(Number(e.target.value) ? 'Alertes mises en silence 🔕' : 'Alertes réactivées 🔔');
+    loadMonitors();
+  };
   $('#d-clone').onclick = () => openMonitorForm({ ...m.config, id: undefined, pushToken: undefined, name: m.config.name + ' (copie)' });
   $('#d-del').onclick = async () => {
     if (!confirm(`Supprimer « ${m.name} » et tout son historique ?`)) return;
@@ -594,11 +614,11 @@ function openMonitorForm(cfg = {}) {
 async function openIncidents() {
   const list = await api('/api/incidents');
   const el = modal(`
-    <div class="panel-head"><h2 style="margin:0">Incidents & maintenances</h2><button class="btn primary" id="i-new">＋ Nouveau</button></div>
+    <div class="panel-head"><h2 style="margin:0">Incidents & maintenances</h2><button class="btn primary need-editor" id="i-new">＋ Nouveau</button></div>
     <div id="i-list">${list.length ? list.map((i) => `<div class="list-item">
       <div style="min-width:0"><b>${esc(i.title)}</b>
         <div class="small muted">${esc(SEV_LABEL[i.severity])} · ${esc(INC_STATUS[i.status])}${i.recurrence ? ' · 🔁 récurrente' : ''} · ${fmtDate(i.createdAt)}</div></div>
-      <div class="actions"><button class="btn sm" data-edit="${i.id}">Mettre à jour</button><button class="btn sm danger" data-del="${i.id}">✕</button></div>
+      <div class="actions need-editor"><button class="btn sm" data-edit="${i.id}">Mettre à jour</button><button class="btn sm danger" data-del="${i.id}">✕</button></div>
     </div>`).join('') : '<p class="muted">Aucun incident. Publie un incident ou planifie une maintenance pour informer tes utilisateurs.</p>'}</div>
     <div class="modal-foot"><button class="btn" onclick="closeModal()">Fermer</button></div>`, true);
   $('#i-new', el).onclick = () => incidentForm();
@@ -720,6 +740,78 @@ function notifForm(n) {
     try { await api(isEdit ? '/api/notifications/' + n.id : '/api/notifications', { method: isEdit ? 'PUT' : 'POST', body: collect() }); toast('Notification enregistrée'); openNotifications(); }
     catch (err) { toast(err.message, true); }
   };
+}
+
+// Utilisateurs et clés API (admin)
+async function openUsers() {
+  const [{ me, users }, keys] = await Promise.all([api('/api/users'), api('/api/apikeys')]);
+  const roleSel = (id, cur, attr) => `<select ${attr}="${id}" style="width:auto">${Object.entries(ROLE_FR).map(([k, v]) => `<option value="${k}" ${cur === k ? 'selected' : ''}>${v}</option>`).join('')}</select>`;
+  const el = modal(`
+    <h2>Utilisateurs</h2>
+    <p class="muted small" style="margin-top:0"><b>Lecteur</b> : consulte tout. <b>Éditeur</b> : gère les monitors et les incidents. <b>Administrateur</b> : tout, y compris paramètres, notifications, pages, utilisateurs et sauvegardes.</p>
+    ${users.map((u) => `<div class="list-item">
+      <div style="min-width:0"><b>👤 ${esc(u.username)}</b>${u.id === me ? ' <span class="pill s-1">toi</span>' : ''}
+        <div class="small muted">${u.lastLogin ? 'Dernière connexion : ' + fmtDate(u.lastLogin) : 'Jamais connecté'}</div></div>
+      <div class="actions">${roleSel(u.id, u.role, 'data-role')}<button class="btn sm" data-pw="${u.id}">🔑</button>${u.id !== me ? `<button class="btn sm danger" data-del="${u.id}">✕</button>` : ''}</div>
+    </div>`).join('')}
+    <form id="u-new" class="row3" style="align-items:end;margin-top:12px">
+      <div class="field"><label>Identifiant</label><input name="username" required placeholder="modo"></div>
+      <div class="field"><label>Mot de passe</label><input name="password" type="password" required minlength="8" autocomplete="new-password"></div>
+      <div class="field"><label>Rôle</label><div style="display:flex;gap:8px">${roleSel('', 'viewer', 'name="role" data-x')}<button class="btn primary">Ajouter</button></div></div>
+    </form>
+
+    <h2 style="margin-top:22px">Clés API</h2>
+    <p class="muted small" style="margin-top:0">Pour tes scripts ou un bot : en-tête <code>Authorization: Bearer cs_…</code> (et <code>Content-Type: application/json</code> pour les modifications). Ex. : <code>curl -H "Authorization: Bearer cs_…" ${esc(location.origin)}/api/monitors</code></p>
+    <div id="k-new-key"></div>
+    ${keys.length ? keys.map((k) => `<div class="list-item"><div><b>🗝️ ${esc(k.name)}</b> <span class="muted small">${esc(k.prefix)}… · ${ROLE_FR[k.role]} · ${k.lastUsed ? 'utilisée ' + ago(k.lastUsed) : 'jamais utilisée'}</span></div><button class="btn sm danger" data-kdel="${k.id}">Révoquer</button></div>`).join('') : '<p class="muted small">Aucune clé API.</p>'}
+    <form id="k-new" class="row3" style="align-items:end;margin-top:12px">
+      <div class="field"><label>Nom de la clé</label><input name="name" required placeholder="Bot Discord"></div>
+      <div class="field"><label>Rôle</label>${roleSel('', 'viewer', 'name="role" data-x')}</div>
+      <div class="field"><button class="btn primary" style="width:100%;justify-content:center">Créer une clé</button></div>
+    </form>
+    <div class="modal-foot"><button class="btn" onclick="closeModal()">Fermer</button></div>`, true);
+  $$('[data-role]', el).forEach((s) => (s.onchange = async () => {
+    try { await api('/api/users/' + s.dataset.role, { method: 'PUT', body: { role: s.value } }); toast('Rôle modifié'); } catch (e) { toast(e.message, true); openUsers(); }
+  }));
+  $$('[data-pw]', el).forEach((b) => (b.onclick = async () => {
+    const pw = prompt('Nouveau mot de passe (8 caractères minimum) :');
+    if (!pw) return;
+    try { await api('/api/users/' + b.dataset.pw, { method: 'PUT', body: { password: pw } }); toast('Mot de passe modifié'); } catch (e) { toast(e.message, true); }
+  }));
+  $$('[data-del]', el).forEach((b) => (b.onclick = async () => {
+    if (!confirm('Supprimer cet utilisateur ?')) return;
+    try { await api('/api/users/' + b.dataset.del, { method: 'DELETE' }); openUsers(); } catch (e) { toast(e.message, true); }
+  }));
+  $('#u-new', el).onsubmit = async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    try { await api('/api/users', { method: 'POST', body: { username: f.username.value.trim(), password: f.password.value, role: f.role.value } }); toast('Utilisateur ajouté'); openUsers(); } catch (err) { toast(err.message, true); }
+  };
+  $$('[data-kdel]', el).forEach((b) => (b.onclick = async () => {
+    if (!confirm('Révoquer cette clé ? Les scripts qui l’utilisent ne fonctionneront plus.')) return;
+    await api('/api/apikeys/' + b.dataset.kdel, { method: 'DELETE' }); openUsers();
+  }));
+  $('#k-new', el).onsubmit = async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    try {
+      const r = await api('/api/apikeys', { method: 'POST', body: { name: f.name.value.trim(), role: f.role.value } });
+      await openUsers();
+      $('#k-new-key').innerHTML = `<div class="banner success" style="flex-direction:column;align-items:stretch">⚠️ Copie cette clé maintenant, elle ne sera plus jamais affichée :<input readonly value="${esc(r.key)}" onclick="this.select()" style="margin-top:8px;font-family:ui-monospace,monospace"></div>`;
+    } catch (err) { toast(err.message, true); }
+  };
+}
+
+// Journal d'activité (admin)
+async function openAudit() {
+  const list = await api('/api/audit?limit=300');
+  modal(`
+    <h2>Journal d'activité</h2>
+    <p class="muted small" style="margin-top:0">Les 1 000 dernières actions sont conservées (connexions, créations, modifications, suppressions).</p>
+    ${list.length ? `<div class="table-scroll" style="max-height:60vh;overflow:auto"><table><thead><tr><th>Date</th><th>Qui</th><th>Action</th><th>Cible</th></tr></thead><tbody>
+      ${list.map((a) => `<tr><td class="muted" style="white-space:nowrap">${fmtDate(a.t)}</td><td>${esc(a.user)}</td><td>${/Échec/.test(a.action) ? '⚠️ ' : ''}${esc(a.action)}</td><td>${esc(a.target)} <span class="muted small">${esc(a.ip || '')}</span></td></tr>`).join('')}
+    </tbody></table></div>` : '<p class="muted">Aucune activité enregistrée.</p>'}
+    <div class="modal-foot"><button class="btn" onclick="closeModal()">Fermer</button></div>`, true);
 }
 
 // Pages de status

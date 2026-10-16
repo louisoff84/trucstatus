@@ -66,6 +66,10 @@ Les données sont stockées dans `./data`, monté comme volume.
 - Notifications : Discord, Slack, Telegram, ntfy, Gotify, Pushover, **email (SMTP)**, webhook JSON (avec envoi de test)
 - Alertes du navigateur quand un service change d'état
 - Sessions conservées après un redémarrage, export / import de la configuration
+- **Multi-utilisateurs** avec rôles (lecteur, éditeur, administrateur) et **journal d'activité**
+- **Clés API** pour piloter le status depuis des scripts ou un bot
+- **Silence des alertes** d'un monitor (1 h, 4 h, 24 h, 7 j) sans arrêter la surveillance
+- **Export CSV** de l'historique d'un monitor (7 jours)
 - **Sauvegardes automatiques** quotidiennes de la base (`data/backups/`, 14 conservées, `BACKUP_KEEP` pour changer)
 
 ## Monitor push
@@ -152,6 +156,38 @@ Le générateur de code se trouve dans *Paramètres*. Les pages protégées par 
 | `GET /embed` | Widget HTML intégrable |
 | `GET /api/service/<id>` | Détail public d'un service (`?hours=24|168`, `?page=<slug>`) |
 | `GET/POST /api/push/<token>` | Réception d'un heartbeat |
+
+## Utilisateurs et rôles
+
+*Admin → Utilisateurs* :
+
+| Rôle | Peut |
+|---|---|
+| Lecteur | tout consulter, exporter en CSV |
+| Éditeur | + créer/modifier/supprimer les monitors, publier les incidents, mettre en silence |
+| Administrateur | + paramètres, notifications, pages, utilisateurs, clés API, sauvegardes, journal |
+
+> **Mise à jour depuis une version ≤ 1.4** : ton ancien mot de passe devient le compte **`admin`** (identifiant `admin`, même mot de passe).
+
+Le **journal d'activité** (*Admin → Journal*) garde les 1 000 dernières actions : qui, quoi, quand, et depuis quelle IP. Les échecs de connexion y figurent aussi.
+
+## Clés API
+
+*Admin → Utilisateurs → Clés API* : choisis un nom et un rôle. La clé `cs_…` n'est affichée **qu'une seule fois**.
+
+```bash
+# Lire l'état complet
+curl -H "Authorization: Bearer cs_xxx" https://status.craftpick.fr/api/monitors
+
+# Publier un incident (rôle éditeur)
+curl -X POST -H "Authorization: Bearer cs_xxx" -H "Content-Type: application/json" \
+  -d '{"title":"Redémarrage du serveur","severity":"maintenance","status":"inprogress","content":"Retour dans 5 min"}' \
+  https://status.craftpick.fr/api/incidents
+
+# Mettre un monitor en silence 1 h
+curl -X POST -H "Authorization: Bearer cs_xxx" -H "Content-Type: application/json" -d '{"minutes":60}' \
+  https://status.craftpick.fr/api/monitors/12/snooze
+```
 
 ## Notifications email
 

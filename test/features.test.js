@@ -95,7 +95,12 @@ before(async () => {
   const r = await call('POST', '/api/setup', { password: 'motdepasse-test' });
   cookie = r.setCookie.split(';')[0];
 });
-after(() => { proc.kill(); servers.forEach((s) => s.close()); fs.rmSync(dataDir, { recursive: true, force: true }); });
+after(async () => {
+  servers.forEach((s) => s.close()); const exited = new Promise((r) => proc.once('exit', r));
+  proc.kill();
+  await exited; // le serveur sauvegarde sa base en s'arrêtant
+  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5 });
+});
 
 test('VarInt : aller-retour', () => {
   for (const n of [0, 1, 127, 128, 255, 25565, 2097151, 767]) assert.strictEqual(readVarInt(writeVarInt(n), 0).value, n);
@@ -428,4 +433,97 @@ test('sauvegardes : création, liste, téléchargement, noms protégés', async 
   assert.ok(Array.isArray(dl.body.monitors));
   assert.strictEqual((await call('GET', '/api/backups/..%2Fdb.json')).status, 404);
   assert.strictEqual((await call('GET', '/api/backups', undefined, false)).status, 401);
+});
+
+// ───────── v1.5 ─────────
+async function as(cookieStr, method, url, body) {
+  const res = await fetch(base + url, { method, headers: { ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), Cookie: cookieStr }, body: body !== undefined ? JSON.stringify(body) : undefined });
+  let j; try { j = await res.json(); } catch { j = null; }
+  return { status: res.status, body: j, setCookie: res.headers.get('set-cookie') };
+}
+async function loginAs(username, password) {
+  const r = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) });
+  return { status: r.status, cookie: (r.headers.get('set-cookie') || '').split(';')[0] };
+}
+
+test('utilisateurs : rôles lecteur / éditeur / admin', async () => {
+  assert.strictEqual((await call('POST', '/api/users', { username: 'modo', password: 'court', role: 'editor' })).status, 400);
+  const ed = (await call('POST', '/api/users', { username: 'modo', password: 'motdepasse-modo', role: 'editor' })).body;
+  await call('POST', '/api/users', { username: 'lecteur', password: 'motdepasse-lect', role: 'viewer' });
+  assert.strictEqual((await call('POST', '/api/users', { username: 'MODO', password: 'motdepasse-x', role: 'viewer' })).status, 400); // doublon
+  assert.strictEqual((await loginAs('modo', 'mauvais')).status, 401);
+  const e = await loginAs('modo', 'motdepasse-modo');
+  const v = await loginAs('lecteur', 'motdepasse-lect');
+  assert.strictEqual(e.status, 200);
+  // lecteur : lecture seule
+  assert.strictEqual((await as(v.cookie, 'GET', '/api/monitors')).status, 200);
+  assert.strictEqual((await as(v.cookie, 'POST', '/api/monitors', { name: 'x', type: 'push' })).status, 403);
+  // éditeur : monitors oui, paramètres non, notifications sans secrets
+  const created = await as(e.cookie, 'POST', '/api/monitors', { name: 'Par le modo', type: 'push', interval: 60 });
+  assert.strictEqual(created.status, 200);
+  assert.strictEqual((await as(e.cookie, 'GET', '/api/settings')).status, 403);
+  assert.strictEqual((await as(e.cookie, 'POST', '/api/users', { username: 'pirate', password: 'motdepasse-p' })).status, 403);
+  const notifs = (await as(e.cookie, 'GET', '/api/notifications')).body;
+  assert.ok(notifs.every((n) => n.config === undefined));
+  assert.strictEqual((await as(e.cookie, 'GET', '/api/me')).body.user.role, 'editor');
+  // on ne peut pas retirer le dernier admin
+  const users = (await call('GET', '/api/users')).body;
+  const admin = users.users.find((u) => u.role === 'admin');
+  assert.strictEqual((await call('PUT', '/api/users/' + admin.id, { role: 'viewer' })).status, 400);
+  assert.strictEqual((await call('DELETE', '/api/users/' + admin.id)).status, 400);
+  // supprimer un utilisateur coupe ses sessions
+  await call('DELETE', '/api/users/' + ed.id);
+  assert.strictEqual((await as(e.cookie, 'GET', '/api/monitors')).status, 401);
+});
+
+test('clés API : Bearer, rôle, révocation', async () => {
+  const k = (await call('POST', '/api/apikeys', { name: 'Bot', role: 'editor' })).body;
+  assert.match(k.key, /^cs_[0-9a-f]{48}$/);
+  const list = (await call('GET', '/api/apikeys')).body;
+  assert.ok(list.every((x) => x.hash === undefined && x.key === undefined));
+  const h = { Authorization: 'Bearer ' + k.key, 'Content-Type': 'application/json' };
+  const r = await fetch(base + '/api/incidents', { method: 'POST', headers: h, body: JSON.stringify({ title: 'Créé par le bot', severity: 'info', status: 'investigating' }) });
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual((await fetch(base + '/api/settings', { headers: h })).status, 403);
+  await call('DELETE', '/api/apikeys/' + k.id);
+  assert.strictEqual((await fetch(base + '/api/monitors', { headers: h })).status, 401);
+});
+
+test('journal d’activité : actions et échecs de connexion', async () => {
+  const log = (await call('GET', '/api/audit')).body;
+  assert.ok(log.some((a) => a.action === 'Utilisateur créé' && a.target === 'modo'));
+  assert.ok(log.some((a) => a.action === 'Monitor créé' && a.user === 'modo' && a.target === 'Par le modo'));
+  assert.ok(log.some((a) => a.action === 'Incident publié' && /Bot/.test(a.user)));
+  assert.ok(log.some((a) => a.action === 'Échec de connexion' && a.target === 'modo'));
+  assert.ok(log.some((a) => a.action === 'Utilisateur supprimé' && a.target === 'modo'));
+});
+
+test('silence des alertes : aucune notification pendant le silence', async () => {
+  const got = [];
+  const srv = http.createServer((req, res) => { let b = ''; req.on('data', (c) => (b += c)); req.on('end', () => { got.push(JSON.parse(b)); res.end('{}'); }); });
+  servers.push(srv);
+  const port = await listen(srv);
+  const n = (await call('POST', '/api/notifications', { name: 'Hook silence', type: 'webhook', config: { url: `http://127.0.0.1:${port}/` } })).body;
+  const m = (await call('POST', '/api/monitors', { name: 'Bruyant', type: 'push', interval: 60, notificationIds: [n.id] })).body;
+  await call('GET', m.pushPath);
+  const sn = (await call('POST', `/api/monitors/${m.id}/snooze`, { minutes: 60 })).body;
+  assert.ok(sn.config.snoozeUntil > Date.now());
+  await call('GET', m.pushPath + '?status=down');
+  await sleep(200);
+  assert.strictEqual(got.filter((g) => g.monitor && g.monitor.name === 'Bruyant').length, 0);
+  await call('POST', `/api/monitors/${m.id}/snooze`, { minutes: 0 });
+  await call('GET', m.pushPath);
+  await sleep(200);
+  assert.strictEqual(got.filter((g) => g.monitor && g.monitor.name === 'Bruyant').length, 1); // retour en ligne notifié
+});
+
+test('export CSV de l’historique', async () => {
+  const m = (await call('GET', '/api/monitors')).body.find((x) => x.name === 'Bruyant');
+  const r = await fetch(base + `/api/monitors/${m.id}/export.csv?days=7`, { headers: { Cookie: cookie } });
+  assert.strictEqual(r.status, 200);
+  assert.match(r.headers.get('content-type'), /text\/csv/);
+  const txt = await r.text();
+  const lines = txt.replace(/^\ufeff/, '').split('\r\n');
+  assert.strictEqual(lines[0], 'date;statut;ping_ms;joueurs;message');
+  assert.ok(lines.some((l) => l.includes(';Hors ligne;')));
 });

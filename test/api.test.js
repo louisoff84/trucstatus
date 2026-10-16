@@ -37,7 +37,12 @@ before(async () => {
   }
   throw new Error('Le serveur ne démarre pas');
 });
-after(() => { proc.kill(); fs.rmSync(dataDir, { recursive: true, force: true }); });
+after(async () => {
+  const exited = new Promise((r) => proc.once('exit', r));
+  proc.kill();
+  await exited; // le serveur sauvegarde sa base en s'arrêtant
+  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5 });
+});
 
 test('utilitaires', () => {
   assert.ok(statusMatches(204, '200-299'));

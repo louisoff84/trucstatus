@@ -223,3 +223,7 @@ a.chip:hover { border-color: var(--muted); }
 .cal { display: grid; grid-auto-flow: column; grid-template-rows: repeat(7, 14px); grid-auto-columns: 14px; justify-content: start; gap: 3px; overflow-x: auto; padding-bottom: 4px; }
 .cal i { width: 14px; height: 14px; border-radius: 3px; background: var(--empty); }
 .cal i.b1 { background: var(--up); } .cal i.b4 { background: var(--degraded); } .cal i.bpart { background: var(--pending); } .cal i.b0 { background: var(--down); } .cal i.pad { visibility: hidden; }
+
+/* Rôles : masque les actions non autorisées */
+body.role-viewer .need-editor, body.role-viewer .need-admin, body.role-editor .need-admin { display: none !important; }
+select.btn { padding-right: 28px; }
