@@ -1,6 +1,9 @@
-// Page de status publique
+// Page de status publique (page principale "/" ou page dédiée "/s/<slug>")
+const PAGE = (location.pathname.match(/^\/s\/([a-z0-9-]+)/i) || [])[1] || null;
+const q = PAGE ? '?page=' + encodeURIComponent(PAGE) : '';
 let state = null;
 let lastUpdate = Date.now();
+let es = null;
 
 function incidentHTML(i) {
   const resolved = i.status === 'resolved';
@@ -18,6 +21,29 @@ function incidentHTML(i) {
   </div>`;
 }
 
+function pingText(m) {
+  return m.ping != null && (m.status === 1 || m.status === 4) ? m.ping + ' ms' : '';
+}
+
+function svcHTML(m) {
+  const mc = m.mc;
+  return `<div class="svc" data-id="${m.id}">
+    <div class="svc-top">
+      <div class="svc-name"><span class="dot s${m.status}"></span><span>${esc(m.name)}</span></div>
+      <div style="display:flex;gap:10px;align-items:center">
+        ${mc ? `<span class="chip" title="Joueurs connectés">👥 ${mc.online}/${mc.max}</span>` : ''}
+        <span class="muted small hide-sm ping">${pingText(m)}</span>
+        <span class="pill s${m.status}">${STATUS_LABEL[m.status]}</span>
+      </div>
+    </div>
+    ${m.description ? `<div class="svc-desc">${esc(m.description)}</div>` : ''}
+    ${mc && mc.motd ? `<div class="svc-desc">${esc(mc.motd)}${mc.version ? ` · <span class="muted">${esc(mc.version)}</span>` : ''}</div>` : ''}
+    <div class="bars d90">${dayBarsHTML(m.bars)}</div>
+    <div class="svc-meta"><span><span class="hide-sm">Il y a </span>90 jours</span><span><b>${fmtPct(m.uptime90)}</b> de disponibilité</span><span>Aujourd'hui</span></div>
+    ${m.players24 && m.players24.some((v) => v != null) ? `<div class="players"><span>Joueurs (24 h)</span>${sparklineSVG(m.players24)}<b>max ${Math.max(...m.players24.filter((v) => v != null))}</b></div>` : ''}
+  </div>`;
+}
+
 function render() {
   const s = state;
   document.title = s.title;
@@ -32,16 +58,16 @@ function render() {
   } else {
     const ms = s.monitors;
     const down = ms.filter((m) => m.status === 0).length;
+    const degraded = ms.filter((m) => m.status === 4).length;
     const maint = ms.filter((m) => m.status === 3).length;
-    const activeInc = s.incidents.filter((i) => i.status !== 'resolved' && i.severity !== 'maintenance');
+    const activeInc = s.incidents.filter((i) => i.status !== 'resolved' && i.severity !== 'maintenance' && i.severity !== 'info');
     let cls = 'ok', ic = '✓', txt = 'Tous les systèmes sont opérationnels';
     if (!ms.length) { cls = 'empty'; ic = '…'; txt = 'Aucun service surveillé pour le moment'; }
     else if (ms.every((m) => m.status === 2)) { cls = 'empty'; ic = '…'; txt = 'Vérification des services en cours…'; }
     else if (down && down >= Math.ceil(ms.length / 2)) { cls = 'major'; ic = '!'; txt = 'Panne majeure en cours'; }
-    else if (down || activeInc.some((i) => i.severity === 'danger')) { cls = 'partial'; ic = '!'; txt = `Perturbation partielle — ${down} service${down > 1 ? 's' : ''} hors ligne`; }
-    else if (activeInc.length) { cls = 'partial'; ic = '!'; txt = 'Certains services sont dégradés'; }
+    else if (down || activeInc.some((i) => i.severity === 'danger')) { cls = 'partial'; ic = '!'; txt = down ? `Perturbation partielle — ${down} service${down > 1 ? 's' : ''} hors ligne` : 'Incident en cours'; }
+    else if (degraded || activeInc.length) { cls = 'degraded'; ic = '!'; txt = degraded ? `Performances dégradées — ${degraded} service${degraded > 1 ? 's' : ''} ralenti${degraded > 1 ? 's' : ''}` : 'Certains services sont dégradés'; }
     else if (maint) { cls = 'maint'; ic = '🔧'; txt = 'Maintenance en cours'; }
-    if (!down && activeInc.length && activeInc.every((i) => i.severity === 'info')) { cls = 'ok'; ic = '✓'; txt = 'Tous les systèmes sont opérationnels'; }
     $('#overall').className = 'overall ' + cls;
     $('#overall').innerHTML = `<div class="ic">${ic}</div><div>${txt}<small>${ms.length} service${ms.length > 1 ? 's' : ''} surveillé${ms.length > 1 ? 's' : ''}</small></div>`;
   }
@@ -53,22 +79,12 @@ function render() {
   for (const m of s.monitors) (groups[m.group || 'Services'] ||= []).push(m);
   $('#groups').innerHTML = Object.entries(groups).map(([g, list]) => {
     const anyDown = list.some((m) => m.status === 0);
+    const anyDeg = list.some((m) => m.status === 4);
     const anyPending = list.some((m) => m.status === 2);
-    const [gc, gl] = anyDown ? ['s0', 'Perturbé'] : anyPending ? ['s2', 'Vérification…'] : ['s1', 'Opérationnel'];
+    const [gc, gl] = anyDown ? ['s0', 'Perturbé'] : anyDeg ? ['s4', 'Dégradé'] : anyPending ? ['s2', 'Vérification…'] : ['s1', 'Opérationnel'];
     return `<div class="card group">
       <div class="group-head"><span>${esc(g)}</span><span class="pill ${gc}">${gl}</span></div>
-      ${list.map((m) => `<div class="svc" data-id="${m.id}">
-        <div class="svc-top">
-          <div class="svc-name"><span class="dot s${m.status}"></span><span>${esc(m.name)}</span></div>
-          <div style="display:flex;gap:10px;align-items:center">
-            <span class="muted small hide-sm">${m.ping != null && m.status === 1 ? m.ping + ' ms' : ''}</span>
-            <span class="pill s${m.status}">${STATUS_LABEL[m.status]}</span>
-          </div>
-        </div>
-        ${m.description ? `<div class="svc-desc">${esc(m.description)}</div>` : ''}
-        <div class="bars d90">${dayBarsHTML(m.bars)}</div>
-        <div class="svc-meta"><span><span class="hide-sm">Il y a </span>90 jours</span><span><b>${fmtPct(m.uptime90)}</b> de disponibilité</span><span>Aujourd'hui</span></div>
-      </div>`).join('')}
+      ${list.map(svcHTML).join('')}
     </div>`;
   }).join('');
 
@@ -77,31 +93,77 @@ function render() {
     (past.length ? past.map(incidentHTML).join('') : `<div class="card" style="padding:18px 20px" ><span class="muted">Aucun incident signalé ces 7 derniers jours. 🎉</span></div>`);
 }
 
+// Page protégée par mot de passe
+function renderLock(title) {
+  document.title = title || 'Page protégée';
+  $('#title').textContent = title || 'Page protégée';
+  $('#desc').textContent = '';
+  $('#overall').className = 'hidden';
+  $('#incidents').innerHTML = ''; $('#past').innerHTML = '';
+  $('#groups').innerHTML = `<form class="card lock" id="unlock">
+    <div style="font-size:34px">🔒</div>
+    <h2>Page protégée</h2>
+    <p class="muted small" style="margin:0 0 18px">Saisis le mot de passe pour voir l'état des services.</p>
+    <div class="field"><input type="password" id="page-pw" placeholder="Mot de passe" required autocomplete="current-password"></div>
+    <button class="btn primary" style="width:100%;justify-content:center">Déverrouiller</button>
+  </form>`;
+  $('#page-pw').focus();
+  $('#unlock').onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      await api(`/api/pages/${encodeURIComponent(PAGE)}/unlock`, { method: 'POST', body: { password: $('#page-pw').value } });
+      $('#overall').className = 'overall empty';
+      connect();
+      load();
+    } catch (err) { toast(err.message, true); }
+  };
+}
+
 async function load() {
   try {
-    state = await api('/api/status');
+    state = await api('/api/status' + q);
     lastUpdate = Date.now();
     render();
   } catch (e) {
+    if (e.status === 401) {
+      const info = await fetch('/api/status' + q).then((r) => r.json()).catch(() => ({}));
+      return renderLock(info.title);
+    }
+    if (e.status === 404) {
+      $('#overall').className = 'overall empty';
+      $('#overall').innerHTML = `<div class="ic">?</div><div>Cette page de status n'existe pas<small><a href="/">Retour à la page principale</a></small></div>`;
+      return;
+    }
     $('#overall').className = 'overall major';
     $('#overall').innerHTML = `<div class="ic">!</div><div>Impossible de joindre le serveur de status</div>`;
   }
 }
 
-setInterval(() => { $('#updated').textContent = `Mis à jour ${ago(lastUpdate)} · actualisation en temps réel`; }, 1000);
-setInterval(load, 60000);
+setInterval(() => { if (state) $('#updated').textContent = `Mis à jour ${ago(lastUpdate)} · actualisation en temps réel`; }, 1000);
+setInterval(() => { if (state) load(); }, 60000);
 
 let refreshTimer;
-liveEvents(({ monitorId, beat }) => {
-  if (!state) return;
-  const m = state.monitors.find((x) => x.id === monitorId);
-  if (!m) return;
-  lastUpdate = Date.now();
-  // Le statut change : on recharge les stats complètes (léger, avec anti-rebond)
-  if (beat.s !== m.status) { clearTimeout(refreshTimer); refreshTimer = setTimeout(load, 500); return; }
-  m.ping = beat.p;
-  const el = document.querySelector(`.svc[data-id="${monitorId}"] .muted.small`);
-  if (el) el.textContent = beat.p != null && beat.s === 1 ? beat.p + ' ms' : '';
-}, load);
+function connect() {
+  if (es) es.close();
+  es = liveEvents(({ monitorId, beat }) => {
+    if (!state) return;
+    const m = state.monitors.find((x) => x.id === monitorId);
+    if (!m) return;
+    lastUpdate = Date.now();
+    // Le statut change : on recharge les stats complètes (avec anti-rebond)
+    if (beat.s !== m.status && beat.s !== 2) { clearTimeout(refreshTimer); refreshTimer = setTimeout(load, 500); return; }
+    m.ping = beat.p;
+    const el = document.querySelector(`.svc[data-id="${monitorId}"] .ping`);
+    if (el) el.textContent = pingText(m);
+    if (beat.pl != null && m.mc) {
+      m.mc.online = beat.pl;
+      const chip = document.querySelector(`.svc[data-id="${monitorId}"] .chip`);
+      if (chip) chip.textContent = `👥 ${m.mc.online}/${m.mc.max}`;
+    }
+  }, load, PAGE);
+}
 
+// Liens d'historique propres à la page
+if (PAGE) $$('a[href="/history"]').forEach((a) => (a.href = `/s/${PAGE}/history`));
+connect();
 load();

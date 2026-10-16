@@ -92,8 +92,12 @@ function readBody(req) {
 const clamp = (v, min, max, def) => { const n = Number(v); return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def; };
 const str = (v, max = 500) => (v == null ? '' : String(v).slice(0, max));
 
-const MONITOR_TYPES = ['http', 'keyword', 'json', 'tcp', 'ping', 'dns', 'push'];
+const MONITOR_TYPES = ['http', 'keyword', 'json', 'tcp', 'ping', 'dns', 'push', 'minecraft', 'proxmox'];
+// Champs secrets : jamais renvoyés au navigateur ; laissés vides dans le formulaire = valeur conservée
+const SECRET_FIELDS = ['basicAuthPass', 'pveTokenSecret'];
 function sanitizeMonitor(b, existing = {}) {
+  b = { ...b };
+  for (const f of SECRET_FIELDS) if (!b[f] && existing[f]) b[f] = existing[f];
   const m = {
     ...existing,
     name: str(b.name, 100) || 'Sans nom',
@@ -130,9 +134,24 @@ function sanitizeMonitor(b, existing = {}) {
     basicAuthPass: str(b.basicAuthPass, 200),
     pushToken: existing.pushToken
       || (/^[A-Za-z0-9]{16,64}$/.test(b.pushToken || '') && !db.data.monitors.some((x) => x.pushToken === b.pushToken) ? b.pushToken : crypto.randomBytes(16).toString('hex')),
+    // Statut dégradé
+    degradedMs: clamp(b.degradedMs, 0, 300000, 0),
+    notifyDegraded: !!b.notifyDegraded,
+    // Minecraft
+    mcEdition: b.mcEdition === 'bedrock' ? 'bedrock' : 'java',
+    // Proxmox
+    pveNode: str(b.pveNode, 100),
+    pveTokenId: str(b.pveTokenId, 200),
+    pveTokenSecret: str(b.pveTokenSecret, 200),
+    pveVmids: str(b.pveVmids, 500),
+    pveCpu: clamp(b.pveCpu, 0, 100, 0),
+    pveMem: clamp(b.pveMem, 0, 100, 0),
+    pveDisk: clamp(b.pveDisk, 0, 100, 0),
   };
-  if (['http', 'keyword', 'json'].includes(m.type) && !/^https?:\/\//i.test(m.url)) throw new Error("L'URL doit commencer par http:// ou https://");
-  if (['tcp', 'ping', 'dns'].includes(m.type) && !m.hostname) throw new Error('Nom d’hôte requis');
+  if (['http', 'keyword', 'json', 'proxmox'].includes(m.type) && !/^https?:\/\//i.test(m.url)) throw new Error("L'URL doit commencer par http:// ou https://");
+  if (['tcp', 'ping', 'dns', 'minecraft'].includes(m.type) && !m.hostname) throw new Error('Nom d’hôte requis');
+  if (m.type === 'proxmox' && (!m.pveNode || !m.pveTokenId || !m.pveTokenSecret)) throw new Error('Nœud, ID du jeton et secret Proxmox requis');
+  if (m.type === 'proxmox' && !/^[^@\s]+@[^!\s]+![^\s=]+$/.test(m.pveTokenId)) throw new Error('ID du jeton au format utilisateur@realm!nom (ex. root@pam!status)');
   if (m.type === 'tcp' && !m.port) throw new Error('Port requis');
   if (m.type === 'keyword' && !m.keyword) throw new Error('Mot-clé requis');
   if (m.type === 'json' && !m.jsonPath) throw new Error('Chemin JSON requis');
@@ -143,8 +162,8 @@ function sanitizeMonitor(b, existing = {}) {
 function rawStats(id, hours) {
   const since = Date.now() - hours * 3600 * 1000;
   const beats = (db.data.beats[id] || []).filter((b) => b.t >= since && b.s !== 2);
-  const up = beats.filter((b) => b.s === 1 || b.s === 3).length;
-  const pings = beats.filter((b) => b.s === 1 && typeof b.p === 'number').map((b) => b.p);
+  const up = beats.filter((b) => b.s === 1 || b.s === 3 || b.s === 4).length;
+  const pings = beats.filter((b) => (b.s === 1 || b.s === 4) && typeof b.p === 'number').map((b) => b.p);
   return {
     uptime: beats.length ? (up / beats.length) * 100 : null,
     avgPing: pings.length ? Math.round(pings.reduce((a, b) => a + b, 0) / pings.length) : null,
@@ -165,7 +184,7 @@ function dailyBars(id, days = 90) {
   for (let i = days - 1; i >= 0; i--) {
     const k = db.dayKey(Date.now() - i * 86400000);
     const d = daily[k];
-    out.push(d ? { d: k, u: +((d.up / d.n) * 100).toFixed(2), p: d.pn ? Math.round(d.p / d.pn) : null, down: d.n - d.up } : { d: k, u: null });
+    out.push(d ? { d: k, u: +((d.up / d.n) * 100).toFixed(2), p: d.pn ? Math.round(d.p / d.pn) : null, down: d.n - d.up, dg: d.dg || 0 } : { d: k, u: null });
   }
   return out;
 }
@@ -179,7 +198,26 @@ function currentStatus(m) {
 function target(m) {
   if (['http', 'keyword', 'json'].includes(m.type)) return m.url;
   if (m.type === 'push') return 'Push (heartbeat)';
+  if (m.type === 'proxmox') return `${m.url} · nœud ${m.pveNode}`;
+  if (m.type === 'minecraft') return m.hostname + (m.port ? ':' + m.port : '') + (m.mcEdition === 'bedrock' ? ' (Bedrock)' : '');
   return m.hostname + (m.port && m.type === 'tcp' ? ':' + m.port : '');
+}
+// Joueurs Minecraft : maximum par heure sur les dernières 24 h
+function playersSeries(id) {
+  const now = Date.now();
+  const out = Array(24).fill(null);
+  for (const b of db.data.beats[id] || []) {
+    if (b.pl == null || now - b.t > 24 * 3600e3) continue;
+    const h = 23 - Math.floor((now - b.t) / 3600e3);
+    if (h >= 0) out[h] = Math.max(out[h] ?? 0, b.pl);
+  }
+  return out;
+}
+function publicConfig(m) {
+  const c = { ...m };
+  c.secretsSet = {};
+  for (const f of SECRET_FIELDS) { c.secretsSet[f] = !!m[f]; c[f] = ''; }
+  return c;
 }
 function monitorSummary(m, admin) {
   const st = monitor.getState(m.id);
@@ -191,12 +229,72 @@ function monitorSummary(m, admin) {
     avgPing24: s24.avgPing,
     ping: st.lastBeat ? st.lastBeat.p : null,
     bars: dailyBars(m.id),
-    recent: (db.data.beats[m.id] || []).slice(-60).map((b) => ({ t: b.t, s: b.s, p: b.p, ...(admin ? { m: b.m } : {}) })),
+    recent: (db.data.beats[m.id] || []).slice(-60).map((b) => ({ t: b.t, s: b.s, p: b.p, ...(b.pl != null ? { pl: b.pl } : {}), ...(admin ? { m: b.m } : {}) })),
   };
   if (admin || m.showTarget) base.target = target(m);
-  if (admin) Object.assign(base, { config: m, cert: st.cert || null, lastMsg: st.lastBeat ? st.lastBeat.m : null, pushPath: `/api/push/${m.pushToken}` });
+  if (m.type === 'minecraft') {
+    const x = st.extra && st.extra.kind === 'minecraft' ? st.extra : null;
+    base.mc = x && (base.status === 1 || base.status === 4) ? { online: x.online, max: x.max, version: x.version, motd: x.motd } : null;
+    base.players24 = playersSeries(m.id);
+  }
+  if (admin) Object.assign(base, { config: publicConfig(m), cert: st.cert || null, extra: st.extra || null, lastMsg: st.lastBeat ? st.lastBeat.m : null, pushPath: `/api/push/${m.pushToken}` });
   return base;
 }
+
+// ───────────────────────── Pages de status ─────────────────────────
+db.data.pages ||= [];
+db.data.settings.pageSecret ||= crypto.randomBytes(32).toString('hex');
+const pageCookie = (p) => `cs_p${p.id}`;
+const pageToken = (p) => crypto.createHmac('sha256', db.data.settings.pageSecret).update(`${p.id}:${p.passwordHash}`).digest('hex');
+function pageAccess(req, p) {
+  if (!p.passwordHash || isAuthed(req)) return true;
+  const c = parseCookies(req)[pageCookie(p)];
+  const t = pageToken(p);
+  return !!c && c.length === t.length && crypto.timingSafeEqual(Buffer.from(c), Buffer.from(t));
+}
+const findPage = (slug) => db.data.pages.find((p) => p.slug === String(slug || '').toLowerCase());
+// Monitors visibles : ceux de la page, sinon tous les monitors publics
+function visibleMonitorIds(page) {
+  if (page) return new Set(page.monitorIds || []);
+  return new Set(db.data.monitors.filter((m) => m.isPublic).map((m) => m.id));
+}
+// Un incident est visible s'il ne cible aucun monitor (global) ou au moins un monitor visible
+function visibleIncidents(ids) {
+  return db.data.incidents
+    .filter((i) => !i.monitorIds || !i.monitorIds.length || i.monitorIds.some((id) => ids.has(id)))
+    .map((i) => ({ ...publicIncident(i), monitorIds: (i.monitorIds || []).filter((id) => ids.has(id)) }));
+}
+// Résout ?page=<slug> : renvoie { page } ou envoie l'erreur (404 / 401 verrouillée)
+function resolvePage(req, res, q) {
+  const slug = q.get('page');
+  if (!slug) return { page: null };
+  const page = findPage(slug);
+  if (!page) { send(res, 404, { error: 'Page introuvable' }); return null; }
+  if (!pageAccess(req, page)) { send(res, 401, { locked: true, title: page.title }); return null; }
+  return { page };
+}
+function sanitizePage(b, existing = {}) {
+  const slug = String(b.slug || '').toLowerCase().trim();
+  if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(slug)) throw new Error('Adresse : lettres minuscules, chiffres et tirets (40 max)');
+  if (db.data.pages.some((p) => p.slug === slug && p.id !== existing.id)) throw new Error('Cette adresse est déjà utilisée');
+  const p = {
+    ...existing,
+    slug,
+    title: str(b.title, 100) || slug,
+    description: str(b.description, 500),
+    logoUrl: str(b.logoUrl, 1000),
+    footer: str(b.footer, 500),
+    monitorIds: Array.isArray(b.monitorIds) ? b.monitorIds.map(Number).filter((id) => db.data.monitors.some((m) => m.id === id)) : [],
+  };
+  if (b.removePassword) { p.passwordHash = null; p.salt = null; }
+  else if (b.password) {
+    if (String(b.password).length < 4) throw new Error('Mot de passe de la page : 4 caractères minimum');
+    p.salt = crypto.randomBytes(16).toString('hex');
+    p.passwordHash = hashPassword(String(b.password), p.salt);
+  }
+  return p;
+}
+const adminPage = (p) => ({ id: p.id, slug: p.slug, title: p.title, description: p.description, logoUrl: p.logoUrl, footer: p.footer, monitorIds: p.monitorIds, protected: !!p.passwordHash });
 function publicIncident(i) {
   return { id: i.id, title: i.title, content: i.content, severity: i.severity, status: i.status, createdAt: i.createdAt, updatedAt: i.updatedAt, resolvedAt: i.resolvedAt, startsAt: i.startsAt, endsAt: i.endsAt, monitorIds: i.monitorIds, updates: i.updates || [] };
 }
@@ -206,8 +304,14 @@ const clients = new Set();
 function broadcast(evt) {
   const m = db.data.monitors.find((x) => x.id === evt.monitorId);
   for (const c of clients) {
-    if (!c.admin && (!m || !m.isPublic)) continue;
-    const beat = c.admin ? evt.beat : { t: evt.beat.t, s: evt.beat.s, p: evt.beat.p };
+    if (!c.admin) {
+      if (!m) continue;
+      if (c.pageId) {
+        const page = db.data.pages.find((p) => p.id === c.pageId);
+        if (!page || !(page.monitorIds || []).includes(m.id)) continue;
+      } else if (!m.isPublic) continue;
+    }
+    const beat = c.admin ? evt.beat : { t: evt.beat.t, s: evt.beat.s, p: evt.beat.p, ...(evt.beat.pl != null ? { pl: evt.beat.pl } : {}) };
     c.res.write(`event: beat\ndata: ${JSON.stringify({ monitorId: evt.monitorId, beat })}\n\n`);
   }
 }
@@ -225,19 +329,49 @@ const route = (method, pattern, handler, auth = false) => {
 };
 
 // Public
-route('GET', '/api/status', (req, res) => {
+route('GET', '/api/status', (req, res, p, q) => {
+  const r = resolvePage(req, res, q);
+  if (!r) return;
+  const { page } = r;
   const s = db.data.settings;
-  const monitors = db.data.monitors.filter((m) => m.isPublic && m.active).map((m) => monitorSummary(m, false));
+  const ids = visibleMonitorIds(page);
+  const monitors = page
+    ? (page.monitorIds || []).map((id) => db.data.monitors.find((m) => m.id === id)).filter((m) => m && m.active).map((m) => monitorSummary(m, false))
+    : db.data.monitors.filter((m) => m.isPublic && m.active).map((m) => monitorSummary(m, false));
   const now = Date.now();
-  const incidents = db.data.incidents
+  const incidents = visibleIncidents(ids)
     .filter((i) => i.status !== 'resolved' || (i.resolvedAt && now - new Date(i.resolvedAt).getTime() < 7 * 86400000))
-    .filter((i) => i.severity !== 'maintenance' || !i.endsAt || new Date(i.endsAt).getTime() > now - 86400000 || i.status !== 'resolved')
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-    .map(publicIncident);
-  send(res, 200, { title: s.title, description: s.description, logoUrl: s.logoUrl || '', footer: s.footer || '', monitors, incidents, setup: !s.adminHash });
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const meta = page
+    ? { title: page.title, description: page.description, logoUrl: page.logoUrl || s.logoUrl || '', footer: page.footer || s.footer || '', page: page.slug }
+    : { title: s.title, description: s.description, logoUrl: s.logoUrl || '', footer: s.footer || '' };
+  send(res, 200, { ...meta, monitors, incidents, setup: !s.adminHash });
 });
-route('GET', '/api/incidents/history', (req, res) => {
-  send(res, 200, db.data.incidents.slice().sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 100).map(publicIncident));
+route('GET', '/api/incidents/history', (req, res, p, q) => {
+  const r = resolvePage(req, res, q);
+  if (!r) return;
+  const list = visibleIncidents(visibleMonitorIds(r.page)).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 100);
+  send(res, 200, list);
+});
+// Déverrouillage d'une page protégée par mot de passe
+route('POST', '/api/pages/:slug/unlock', async (req, res, p) => {
+  const page = findPage(p.slug);
+  if (!page) return send(res, 404, { error: 'Page introuvable' });
+  if (!page.passwordHash) return send(res, 200, { ok: true });
+  const ip = clientIp(req);
+  const a = loginAttempts.get('p' + ip) || { n: 0, until: 0 };
+  if (a.until > Date.now()) return send(res, 429, { error: 'Trop de tentatives, réessaie dans quelques minutes' });
+  const b = await readBody(req);
+  const h = Buffer.from(hashPassword(String(b.password || ''), page.salt), 'hex');
+  const ref = Buffer.from(page.passwordHash, 'hex');
+  if (h.length !== ref.length || !crypto.timingSafeEqual(h, ref)) {
+    a.n++; if (a.n >= 5) { a.until = Date.now() + 5 * 60000; a.n = 0; }
+    loginAttempts.set('p' + ip, a);
+    return send(res, 401, { error: 'Mot de passe incorrect' });
+  }
+  loginAttempts.delete('p' + ip);
+  res.setHeader('Set-Cookie', `${pageCookie(page)}=${pageToken(page)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${30 * 86400}${isHttps(req) ? '; Secure' : ''}`);
+  send(res, 200, { ok: true });
 });
 route('GET', '/api/badge/:id', (req, res, p) => {
   const m = db.data.monitors.find((x) => x.id === Number(p.id) && x.isPublic);
@@ -245,8 +379,8 @@ route('GET', '/api/badge/:id', (req, res, p) => {
   const s = currentStatus(m);
   const u = rawStats(m.id, 24).uptime;
   const label = 'status';
-  const val = s === 1 ? `up ${u != null ? u.toFixed(1) + '%' : ''}`.trim() : s === 0 ? 'down' : s === 3 ? 'maintenance' : 'pending';
-  const col = s === 1 ? '#2ecc71' : s === 0 ? '#e74c3c' : s === 3 ? '#3498db' : '#f1c40f';
+  const val = s === 1 ? `up ${u != null ? u.toFixed(1) + '%' : ''}`.trim() : s === 4 ? 'degraded' : s === 0 ? 'down' : s === 3 ? 'maintenance' : 'pending';
+  const col = s === 1 ? '#2ecc71' : s === 4 ? '#f39c12' : s === 0 ? '#e74c3c' : s === 3 ? '#3498db' : '#f1c40f';
   const lw = 48, vw = 8 + val.length * 7;
   res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-cache' });
   res.end(`<svg xmlns="http://www.w3.org/2000/svg" width="${lw + vw}" height="20"><rect width="${lw}" height="20" fill="#555"/><rect x="${lw}" width="${vw}" height="20" fill="${col}"/><g fill="#fff" font-family="Verdana,sans-serif" font-size="11"><text x="6" y="14">${label}</text><text x="${lw + 5}" y="14">${val}</text></g></svg>`);
@@ -255,6 +389,11 @@ route('GET', '/api/events', (req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
   res.write('retry: 3000\n\n');
   const c = { res, admin: isAuthed(req) };
+  const slug = new URL(req.url, 'http://x').searchParams.get('page');
+  if (slug && !c.admin) {
+    const page = findPage(slug);
+    c.pageId = page && pageAccess(req, page) ? page.id : -1; // -1 : aucun événement
+  }
   clients.add(c);
   req.on('close', () => clients.delete(c));
 });
@@ -267,7 +406,7 @@ async function handlePush(req, res, p, q) {
   let body = {};
   if (req.method === 'POST') body = await readBody(req).catch(() => ({}));
   const status = String(q.get('status') || body.status || 'up').toLowerCase();
-  monitor.receivePush(m, { status: status === 'down' ? 'down' : 'up', msg: q.get('msg') || body.msg, ping: q.get('ping') ?? body.ping });
+  monitor.receivePush(m, { status: ['down', 'degraded'].includes(status) ? status : 'up', msg: q.get('msg') || body.msg, ping: q.get('ping') ?? body.ping });
   send(res, 200, { ok: true });
 }
 route('GET', '/api/push/:token', handlePush);
@@ -281,7 +420,7 @@ const xml = (s) => String(s ?? '').replace(/[<>&'"]/g, (c) => ({ '<': '&lt;', '>
 route('GET', '/api/feed.xml', (req, res) => {
   const s = db.data.settings;
   const base = `${isHttps(req) ? 'https' : 'http'}://${req.headers.host || 'localhost'}`;
-  const items = db.data.incidents.slice().sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 50).map((i) => {
+  const items = visibleIncidents(visibleMonitorIds(null)).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 50).map((i) => {
     const last = (i.updates || []).slice(-1)[0];
     return `<item><title>${xml(i.title)}</title><link>${base}/history#i-${i.id}</link><guid isPermaLink="false">incident-${i.id}-${xml(i.updatedAt || i.createdAt)}</guid><pubDate>${new Date(i.updatedAt || i.createdAt).toUTCString()}</pubDate><description>${xml(`[${i.status}] ${last ? last.text : i.content}`)}</description></item>`;
   }).join('');
@@ -353,6 +492,7 @@ route('DELETE', '/api/monitors/:id', (req, res, p) => {
   const id = Number(p.id);
   db.data.monitors = db.data.monitors.filter((x) => x.id !== id);
   monitor.forget(id);
+  db.data.pages.forEach((pg) => { pg.monitorIds = (pg.monitorIds || []).filter((x) => x !== id); });
   db.removeMonitorData(id);
   send(res, 200, { ok: true });
 }, true);
@@ -363,7 +503,13 @@ route('GET', '/api/monitors/:id/beats', (req, res, p, q) => {
 }, true);
 route('POST', '/api/monitors/test', async (req, res) => {
   const m = sanitizeMonitor(await readBody(req));
-  try { const r = await monitor.runCheck(m); send(res, 200, { ok: true, ping: r.ping, msg: r.msg }); }
+  if (m.type === 'push') return send(res, 200, { ok: false, msg: 'Un monitor push ne peut pas être testé : il attend les appels de ton service.' });
+  try {
+    const r = await monitor.runCheck(m);
+    const beat = { s: 1, p: r.ping, m: r.msg };
+    monitor.applyDegraded(m, beat, r.degraded);
+    send(res, 200, { ok: true, degraded: beat.s === 4, ping: r.ping, msg: beat.m });
+  }
   catch (e) { send(res, 200, { ok: false, msg: e.message }); }
 }, true);
 
@@ -453,6 +599,25 @@ route('POST', '/api/notifications/test', async (req, res) => {
   } catch (e) { send(res, 200, { ok: false, error: e.message }); }
 }, true);
 
+// Pages de status (admin)
+route('GET', '/api/pages', (req, res) => send(res, 200, db.data.pages.map(adminPage)), true);
+route('POST', '/api/pages', async (req, res) => {
+  const p = sanitizePage(await readBody(req));
+  p.id = db.nextId();
+  db.data.pages.push(p); db.save();
+  send(res, 200, adminPage(p));
+}, true);
+route('PUT', '/api/pages/:id', async (req, res, prm) => {
+  const idx = db.data.pages.findIndex((x) => x.id === Number(prm.id));
+  if (idx < 0) return send(res, 404, { error: 'Introuvable' });
+  db.data.pages[idx] = sanitizePage(await readBody(req), db.data.pages[idx]); db.save(); broadcastRefresh();
+  send(res, 200, adminPage(db.data.pages[idx]));
+}, true);
+route('DELETE', '/api/pages/:id', (req, res, prm) => {
+  db.data.pages = db.data.pages.filter((x) => x.id !== Number(prm.id)); db.save();
+  send(res, 200, { ok: true });
+}, true);
+
 // Paramètres (admin)
 route('GET', '/api/settings', (req, res) => {
   const { title, description, logoUrl, footer } = db.data.settings;
@@ -476,9 +641,9 @@ route('PUT', '/api/settings', async (req, res) => {
   send(res, 200, { ok: true });
 }, true);
 route('GET', '/api/export', (req, res) => {
-  const { monitors, incidents, notifications } = db.data;
+  const { monitors, incidents, notifications, pages } = db.data;
   res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Disposition': 'attachment; filename="craftpick-status-backup.json"' });
-  res.end(JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), monitors, incidents, notifications }, null, 2));
+  res.end(JSON.stringify({ version: 2, exportedAt: new Date().toISOString(), monitors, incidents, notifications, pages }, null, 2));
 }, true);
 route('POST', '/api/import', async (req, res) => {
   const b = await readBody(req);
@@ -486,11 +651,24 @@ route('POST', '/api/import', async (req, res) => {
   const idMap = {};
   for (const n of b.notifications || []) { const nn = sanitizeNotif(n); nn.id = db.nextId(); idMap[n.id] = nn.id; db.data.notifications.push(nn); }
   let count = 0;
+  const monIdMap = {};
   for (const raw of b.monitors) {
     try {
       const m = sanitizeMonitor({ ...raw, notificationIds: (raw.notificationIds || []).map((x) => idMap[x]).filter(Boolean) });
       m.id = db.nextId(); m.createdAt = new Date().toISOString();
+      monIdMap[raw.id] = m.id;
       db.data.monitors.push(m); monitor.start(m); count++;
+    } catch {}
+  }
+  db.save();
+  // Pages : on recrée celles dont l'adresse est libre, en conservant leur mot de passe
+  for (const raw of b.pages || []) {
+    try {
+      if (findPage(raw.slug)) continue;
+      const pg = sanitizePage({ ...raw, monitorIds: (raw.monitorIds || []).map((x) => monIdMap[x]).filter(Boolean) });
+      if (raw.passwordHash && raw.salt) { pg.passwordHash = raw.passwordHash; pg.salt = raw.salt; }
+      pg.id = db.nextId();
+      db.data.pages.push(pg);
     } catch {}
   }
   db.save();
@@ -503,6 +681,8 @@ function serveStatic(req, res, pathname) {
   if (pathname === '/') pathname = '/status.html';
   else if (pathname === '/admin' || pathname === '/admin/') pathname = '/admin.html';
   else if (pathname === '/history') pathname = '/history.html';
+  else if (/^\/s\/[a-z0-9-]+\/?$/i.test(pathname)) pathname = '/status.html';
+  else if (/^\/s\/[a-z0-9-]+\/history\/?$/i.test(pathname)) pathname = '/history.html';
   const file = path.normalize(path.join(PUBLIC_DIR, pathname));
   if (!file.startsWith(PUBLIC_DIR)) { res.writeHead(403); return res.end(); }
   fs.readFile(file, (err, buf) => {

@@ -3,7 +3,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
-const STATUS_LABEL = { 1: 'En ligne', 0: 'Hors ligne', 2: 'En attente', 3: 'Maintenance', '-1': 'En pause' };
+const STATUS_LABEL = { 1: 'En ligne', 0: 'Hors ligne', 2: 'En attente', 3: 'Maintenance', 4: 'Dégradé', '-1': 'En pause' };
 const INC_STATUS = { investigating: 'Enquête en cours', identified: 'Problème identifié', monitoring: 'Sous surveillance', resolved: 'Résolu', scheduled: 'Planifiée', inprogress: 'En cours' };
 const SEV_LABEL = { info: 'Information', warning: 'Dégradation', danger: 'Panne majeure', maintenance: 'Maintenance' };
 
@@ -22,13 +22,13 @@ function ago(t) {
 // Classe CSS d'une barre journalière
 function dayClass(b) {
   if (b.u == null) return '';
-  if (b.u >= 99.9) return 'b1';
+  if (b.u >= 99.9) return b.dg ? 'b4' : 'b1';
   if (b.u >= 95) return 'bpart';
   return 'b0';
 }
 function dayBarsHTML(bars) {
   return bars.map((b) => `<i class="${dayClass(b)}" data-tip="${esc(
-    `<b>${fmtDay(b.d)}</b><br>` + (b.u == null ? 'Aucune donnée' : `Disponibilité : ${fmtPct(b.u)}${b.down ? `<br>${b.down} vérification(s) en échec` : ''}${b.p != null ? `<br>Ping moyen : ${b.p} ms` : ''}`)
+    `<b>${fmtDay(b.d)}</b><br>` + (b.u == null ? 'Aucune donnée' : `Disponibilité : ${fmtPct(b.u)}${b.down ? `<br>${b.down} vérification(s) en échec` : ''}${b.dg ? `<br>${b.dg} vérification(s) dégradée(s)` : ''}${b.p != null ? `<br>Ping moyen : ${b.p} ms` : ''}`)
   )}"></i>`).join('');
 }
 function beatBarsHTML(beats, n = 40) {
@@ -102,8 +102,26 @@ function toast(msg, err = false) {
   setTimeout(() => t.remove(), 4000);
 }
 
-function liveEvents(onBeat, onRefresh) {
-  const es = new EventSource('/api/events');
+// Mini-courbe SVG (joueurs Minecraft sur 24 h)
+function sparklineSVG(values, { w = 240, h = 32 } = {}) {
+  const pts = values.map((v, i) => (v == null ? null : [i, v]));
+  const vals = values.filter((v) => v != null);
+  if (!vals.length) return '';
+  const max = Math.max(1, ...vals);
+  const x = (i) => (i / Math.max(1, values.length - 1)) * (w - 2) + 1;
+  const y = (v) => h - 2 - (v / max) * (h - 4);
+  let d = '', open = false;
+  if (vals.length === 1) d = `M1 ${y(vals[0]).toFixed(1)} L${w - 1} ${y(vals[0]).toFixed(1)}`; // un seul point : ligne plate
+  else for (const p of pts) {
+    if (!p) { open = false; continue; }
+    d += (open ? 'L' : 'M') + x(p[0]).toFixed(1) + ' ' + y(p[1]).toFixed(1) + ' ';
+    open = true;
+  }
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true"><path d="${d}" fill="none" stroke="currentColor" stroke-width="1.6" vector-effect="non-scaling-stroke" stroke-linejoin="round"/></svg>`;
+}
+
+function liveEvents(onBeat, onRefresh, page) {
+  const es = new EventSource('/api/events' + (page ? '?page=' + encodeURIComponent(page) : ''));
   es.addEventListener('beat', (e) => onBeat(JSON.parse(e.data)));
   es.addEventListener('refresh', () => onRefresh && onRefresh());
   return es;

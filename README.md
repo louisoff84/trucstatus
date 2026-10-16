@@ -38,6 +38,9 @@ Les données sont stockées dans `./data`, monté comme volume.
 - HTTP(S) avec vérification d'une valeur JSON (`data.status = ok`)
 - Port TCP, ping ICMP (Windows et Linux), DNS (A, AAAA, MX, TXT…, serveur personnalisé)
 - **Push / heartbeat** : ton script ou ton cron appelle une URL ; s'il ne le fait plus dans le délai prévu, le monitor passe hors ligne
+- **Serveur Minecraft** (Java et Bedrock) : joueurs connectés, version, MOTD, courbe de fréquentation ; SRV `_minecraft._tcp` pris en charge
+- **Nœud Proxmox VE** via l'API : CPU, RAM, disque, uptime, VM/CT ; panne si une VM surveillée s'arrête, « Dégradé » si un seuil est dépassé
+- **Statut « Dégradé »** : le service répond, mais au-delà d'un seuil de temps de réponse (orange, compté comme disponible, notification optionnelle)
 - Tentatives avant alerte, intervalle accéléré en cas de panne, **rappels réguliers tant que le service reste en panne**
 - Durée de la panne indiquée au retour du service (« de retour après 12 min »)
 - Suivi de l'expiration des certificats TLS, avec alerte
@@ -69,13 +72,45 @@ Après avoir créé un monitor de type « Push », l'URL s'affiche dans sa fiche
 Invoke-WebRequest "https://status.exemple.fr/api/push/<token>" -UseBasicParsing | Out-Null
 ```
 
-Paramètres optionnels : `status=up|down`, `msg=…`, `ping=<ms>`. L'URL accepte GET et POST (JSON).
+Paramètres optionnels : `status=up|down|degraded`, `msg=…`, `ping=<ms>`. L'URL accepte GET et POST (JSON).
+
+## Monitor Minecraft
+
+Type « Serveur Minecraft » : renseigne l'hôte (ex. `play.craftpick.fr`) et choisis l'édition.
+
+- **Java** : utilise le Server List Ping. Si le port est vide, l'enregistrement SRV `_minecraft._tcp.<hôte>` est utilisé, sinon le port 25565.
+- **Bedrock** : ping RakNet en UDP, port 19132 par défaut.
+
+La page publique affiche les joueurs connectés, le MOTD et une courbe sur 24 h. L'admin peut basculer le graphique entre ping et joueurs.
+
+## Monitor Proxmox
+
+1. Dans Proxmox : *Datacenter → Permissions → API Tokens → Add*, par exemple l'utilisateur `root@pam` avec l'ID `status`. Décoche « Privilege Separation » ou donne au jeton le rôle **PVEAuditor** sur `/` (lecture seule).
+2. Dans Craftpick Status : type « Nœud Proxmox »
+   - URL : `https://<ip>:8006`
+   - Nœud : `pve`
+   - ID du jeton : `root@pam!status`
+   - Secret : l'UUID affiché par Proxmox
+3. Options :
+   - VM/CT à surveiller (ex. `100, 101`) : le monitor passe hors ligne si l'une d'elles est arrêtée.
+   - Seuils CPU / RAM / disque : le monitor passe en « Dégradé ».
+
+Le secret du jeton n'est jamais renvoyé au navigateur. « Ignorer les erreurs TLS » est coché par défaut, car Proxmox utilise un certificat auto-signé.
+
+## Pages de status multiples
+
+Menu **Pages** de l'admin : crée par exemple `/s/joueurs` (serveurs de jeu, site, Discord) et `/s/infra` (Proxmox, proxy). Chaque page a :
+- son titre, sa description et son logo ;
+- sa sélection de services, dans l'ordre de ton choix ;
+- un **mot de passe** optionnel, avec un cookie valable 30 jours. Changer le mot de passe déconnecte tout le monde.
+
+La page principale `/` continue d'afficher les monitors marqués « publics ». Un monitor privé peut apparaître sur une page dédiée protégée.
 
 ## API publique
 
 | Route | Description |
 |---|---|
-| `GET /api/status` | État des services publics et incidents |
+| `GET /api/status` | État des services publics et incidents (`?page=<slug>` pour une page dédiée) |
 | `GET /api/health` | Santé du serveur (Docker, autre outil de monitoring) |
 | `GET /api/feed.xml` | Flux RSS des incidents |
 | `GET /api/badge/<id>` | Badge SVG |

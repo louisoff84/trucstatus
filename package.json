@@ -1,6 +1,6 @@
 {
   "name": "craftpick-status",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Système de monitoring et page de status (type Uptime Kuma), sans dépendance",
   "main": "server.js",
   "scripts": {

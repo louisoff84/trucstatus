@@ -5,13 +5,15 @@ let selectedId = null;
 let chartHours = 24;
 let chartBeats = [];
 
-const TYPE_LABEL = { http: 'HTTP(S)', keyword: 'HTTP(S) — Mot-clé', json: 'HTTP(S) — Requête JSON', tcp: 'Port TCP', ping: 'Ping', dns: 'DNS', push: 'Push (heartbeat)' };
+const TYPE_LABEL = { http: 'HTTP(S)', keyword: 'HTTP(S) — Mot-clé', json: 'HTTP(S) — Requête JSON', tcp: 'Port TCP', ping: 'Ping', dns: 'DNS', push: 'Push (heartbeat)', minecraft: 'Serveur Minecraft', proxmox: 'Nœud Proxmox' };
+let chartMode = 'ping'; // 'ping' ou 'players' (Minecraft)
+let pages = [];
 
 // Alertes du navigateur quand un monitor change d'état
 function browserAlert(m, beat) {
   try {
     if (localStorage.getItem('cs-browser-alerts') !== '1' || !('Notification' in window) || Notification.permission !== 'granted') return;
-    new Notification(`${beat.s === 1 ? '✅' : '🔴'} ${m.name} — ${STATUS_LABEL[beat.s]}`, { body: beat.m || '', icon: '/favicon.svg', tag: 'cs-' + m.id });
+    new Notification(`${beat.s === 1 ? '✅' : beat.s === 4 ? '🟠' : '🔴'} ${m.name} — ${STATUS_LABEL[beat.s]}`, { body: beat.m || '', icon: '/favicon.svg', tag: 'cs-' + m.id });
   } catch {}
 }
 
@@ -76,7 +78,7 @@ async function startApp() {
 $('#logout').onclick =async () => { await api('/api/logout', { method: 'POST' }); location.reload(); };
 $('#add-monitor').onclick = () => openMonitorForm();
 $('#search').oninput = renderList;
-$$('[data-open]').forEach((b) => (b.onclick = () => ({ incidents: openIncidents, notifications: openNotifications, settings: openSettings })[b.dataset.open]()));
+$$('[data-open]').forEach((b) => (b.onclick = () => ({ incidents: openIncidents, notifications: openNotifications, settings: openSettings, pages: openPages })[b.dataset.open]()));
 window.addEventListener('hashchange', () => {
   const m = location.hash.match(/^#m-(\d+)/);
   selectedId = m ? Number(m[1]) : null;
@@ -104,7 +106,7 @@ function onBeat({ monitorId, beat }) {
   m.lastMsg = beat.m;
   if (monitorId === selectedId && Date.now() - beat.t < chartHours * 3600e3) { chartBeats.push(beat); }
   if (changed) {
-    if ((beat.s === 0 || beat.s === 1) && m.status !== undefined) browserAlert(m, beat);
+    if (beat.s === 0 || beat.s === 1 || beat.s === 4) browserAlert(m, beat);
     clearTimeout(reloadTimer); reloadTimer = setTimeout(loadMonitors, 400);
   }
   renderList();
@@ -148,6 +150,7 @@ function renderDashboard() {
   $('#main').innerHTML = `
     <div class="summary">
       <div class="card stat"><div class="k">En ligne</div><div class="v" style="color:var(--up)">${c(1)}</div></div>
+      <div class="card stat"><div class="k">Dégradé</div><div class="v" style="color:var(--degraded)">${c(4)}</div></div>
       <div class="card stat"><div class="k">Hors ligne</div><div class="v" style="color:var(--down)">${c(0)}</div></div>
       <div class="card stat"><div class="k">Maintenance</div><div class="v" style="color:var(--maint)">${c(3)}</div></div>
       <div class="card stat"><div class="k">En pause</div><div class="v" style="color:var(--paused)">${c(-1)}</div></div>
@@ -172,6 +175,7 @@ function renderDashboard() {
 function renderDetail(full = true) {
   const m = monitors.find((x) => x.id === selectedId);
   if (!m) return;
+  if (m.type !== 'minecraft') chartMode = 'ping';
   const cert = m.cert;
   const html = `
     <div class="card panel">
@@ -193,6 +197,7 @@ function renderDetail(full = true) {
         </div>
       </div>
       <div class="bars" style="margin-top:20px;height:30px">${beatBarsHTML(m.recent, 60)}</div>
+      ${extraInfoHTML(m)}
     </div>
 
     <div class="stats" style="margin-bottom:20px">
@@ -200,12 +205,16 @@ function renderDetail(full = true) {
       <div class="card stat"><div class="k">Moyenne (24 h)</div><div class="v">${m.avgPing24 ?? '—'}<small>${m.avgPing24 != null ? ' ms' : ''}</small></div></div>
       <div class="card stat"><div class="k">Disponibilité 24 h</div><div class="v">${fmtPct(m.uptime24)}</div></div>
       <div class="card stat"><div class="k">Disponibilité 30 j</div><div class="v">${fmtPct(m.uptime30)}</div></div>
+      ${extraStatsHTML(m)}
       ${cert ? `<div class="card stat"><div class="k">Certificat TLS</div><div class="v" style="color:${cert.daysLeft < 14 ? 'var(--down)' : 'inherit'}">${cert.daysLeft}<small> j</small></div><div class="muted small">${esc(cert.issuer || '')}</div></div>` : ''}
     </div>
 
     <div class="card panel">
-      <div class="panel-head"><h3>Temps de réponse</h3>
+      <div class="panel-head"><h3>${chartMode === 'players' ? 'Joueurs connectés' : 'Temps de réponse'}</h3>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+        ${m.type === 'minecraft' ? `<div class="tabs" id="cmode"><button data-m="ping" class="${chartMode === 'ping' ? 'on' : ''}">Ping</button><button data-m="players" class="${chartMode === 'players' ? 'on' : ''}">Joueurs</button></div>` : ''}
         <div class="tabs" id="ranges">${[[1, '1 h'], [6, '6 h'], [24, '24 h'], [168, '7 j']].map(([h, l]) => `<button data-h="${h}" class="${h === chartHours ? 'on' : ''}">${l}</button>`).join('')}</div>
+        </div>
       </div>
       <div class="chart-wrap"><canvas id="chart"></canvas></div>
     </div>
@@ -247,7 +256,42 @@ function renderDetail(full = true) {
   $('#main').innerHTML = html;
   bindDetail(m);
   $$('#ranges button').forEach((b) => (b.onclick = () => { chartHours = Number(b.dataset.h); $$('#ranges button').forEach((x) => x.classList.toggle('on', x === b)); loadChart(); }));
+  $$('#cmode button').forEach((b) => (b.onclick = () => { chartMode = b.dataset.m; renderDetail(true); }));
   loadChart();
+}
+
+function fmtUptime(sec) {
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600);
+  return d ? `${d} j ${h} h` : `${h} h ${Math.floor((sec % 3600) / 60)} min`;
+}
+function meter(label, v, limit) {
+  const warn = limit && v > limit;
+  return `<div class="card stat"><div class="k">${label}</div><div class="v" style="${warn ? 'color:var(--degraded)' : ''}">${v}<small> %</small></div><div class="meter"><span class="${warn ? 'warn' : ''}" style="width:${Math.min(100, v)}%"></span></div>${limit ? `<div class="muted small" style="margin-top:4px">seuil ${limit} %</div>` : ''}</div>`;
+}
+function extraStatsHTML(m) {
+  const x = m.extra;
+  if (!x) return '';
+  if (x.kind === 'minecraft') return `
+    <div class="card stat"><div class="k">Joueurs</div><div class="v">${x.online}<small> / ${x.max}</small></div></div>
+    <div class="card stat"><div class="k">Version</div><div class="v" style="font-size:16px">${esc(x.version || '—')}</div></div>`;
+  if (x.kind === 'proxmox') return `
+    ${meter('CPU', x.cpu, m.config.pveCpu)}${meter('RAM', x.mem, m.config.pveMem)}${meter('Disque', x.disk, m.config.pveDisk)}
+    <div class="card stat"><div class="k">VM / CT actives</div><div class="v">${x.running}<small> / ${x.total}</small></div></div>
+    <div class="card stat"><div class="k">Uptime du nœud</div><div class="v" style="font-size:18px">${fmtUptime(x.uptime)}</div><div class="muted small">${esc(x.pveVersion || '')}</div></div>`;
+  return '';
+}
+function extraInfoHTML(m) {
+  const x = m.extra;
+  if (!x) return '';
+  if (x.kind === 'minecraft') return `<div style="margin-top:14px">
+    ${x.motd ? `<div class="small"><span class="muted">MOTD :</span> ${esc(x.motd)}</div>` : ''}
+    ${x.sample && x.sample.length ? `<div class="guests" style="margin-top:8px">${x.sample.map((n) => `<span class="chip">👤 ${esc(n)}</span>`).join('')}</div>` : ''}
+  </div>`;
+  if (x.kind === 'proxmox' && x.guests && x.guests.length) {
+    const watched = String(m.config.pveVmids || '').split(/[\s,;]+/).map(Number).filter(Boolean);
+    return `<div class="guests" style="margin-top:14px">${x.guests.map((g) => `<span class="chip" title="${esc(g.kind)} ${g.vmid}${watched.includes(Number(g.vmid)) ? ' — surveillée' : ''}"><span class="dot ${g.status === 'running' ? 's1' : 's-1'}" style="width:8px;height:8px;animation:none"></span>${watched.includes(Number(g.vmid)) ? '👁 ' : ''}${g.vmid} ${esc(g.name || '')}</span>`).join('')}</div>`;
+  }
+  return '';
 }
 
 function bindDetail(m) {
@@ -290,12 +334,16 @@ function drawChart() {
   ctx.scale(dpr, dpr);
   const css = getComputedStyle(document.documentElement);
   const cMuted = css.getPropertyValue('--muted').trim(), cBorder = css.getPropertyValue('--border').trim();
-  const cUp = css.getPropertyValue('--up').trim(), cDown = css.getPropertyValue('--down').trim(), cMaint = css.getPropertyValue('--maint').trim();
+  const cUp = css.getPropertyValue(chartMode === 'players' ? '--maint' : '--up').trim(), cDown = css.getPropertyValue('--down').trim(), cMaint = css.getPropertyValue('--maint').trim(), cDeg = css.getPropertyValue('--degraded').trim();
   const pad = { l: 48, r: 12, t: 12, b: 26 };
   const now = Date.now(), t0 = now - chartHours * 3600e3;
   const pts = chartBeats.filter((b) => b.t >= t0);
-  const pings = pts.filter((b) => b.s === 1 && b.p != null).map((b) => b.p);
-  const maxP = Math.max(50, ...pings) * 1.15;
+  const players = chartMode === 'players';
+  const val = players ? (b) => b.pl : (b) => b.p;
+  const unit = players ? '' : ' ms';
+  const okBeat = (b) => (players ? b.pl != null : (b.s === 1 || b.s === 4) && b.p != null);
+  const pings = pts.filter(okBeat).map(val);
+  const maxP = Math.max(players ? 5 : 50, ...pings) * 1.15;
   const x = (t) => pad.l + ((t - t0) / (now - t0)) * (W - pad.l - pad.r);
   const y = (p) => pad.t + (1 - p / maxP) * (H - pad.t - pad.b);
 
@@ -304,7 +352,7 @@ function drawChart() {
   for (let i = 0; i <= 4; i++) {
     const v = (maxP / 4) * i, yy = y(v);
     ctx.globalAlpha = .6; ctx.beginPath(); ctx.moveTo(pad.l, yy); ctx.lineTo(W - pad.r, yy); ctx.stroke(); ctx.globalAlpha = 1;
-    ctx.textAlign = 'right'; ctx.fillText(Math.round(v) + ' ms', pad.l - 6, yy + 4);
+    ctx.textAlign = 'right'; ctx.fillText(Math.round(v) + unit, pad.l - 6, yy + 4);
   }
   ctx.textAlign = 'center';
   for (let i = 0; i <= 5; i++) {
@@ -315,8 +363,8 @@ function drawChart() {
   }
   // Zones de panne / maintenance
   for (const b of pts) {
-    if (b.s === 0 || b.s === 3) {
-      ctx.fillStyle = b.s === 0 ? cDown : cMaint; ctx.globalAlpha = .22;
+    if (b.s === 0 || b.s === 3 || b.s === 4) {
+      ctx.fillStyle = b.s === 0 ? cDown : b.s === 4 ? cDeg : cMaint; ctx.globalAlpha = b.s === 4 ? .14 : .22;
       ctx.fillRect(x(b.t) - 2, pad.t, 4, H - pad.t - pad.b);
       ctx.globalAlpha = 1;
     }
@@ -326,15 +374,15 @@ function drawChart() {
     return;
   }
   // Courbe + remplissage
-  const up = pts.filter((b) => b.s === 1 && b.p != null);
+  const up = pts.filter(okBeat);
   const grad = ctx.createLinearGradient(0, pad.t, 0, H - pad.b);
   grad.addColorStop(0, cUp + '55'); grad.addColorStop(1, cUp + '00');
   ctx.beginPath();
-  up.forEach((b, i) => (i ? ctx.lineTo(x(b.t), y(b.p)) : ctx.moveTo(x(b.t), y(b.p))));
+  up.forEach((b, i) => (i ? ctx.lineTo(x(b.t), y(val(b))) : ctx.moveTo(x(b.t), y(val(b)))));
   ctx.lineTo(x(up[up.length - 1].t), y(0)); ctx.lineTo(x(up[0].t), y(0)); ctx.closePath();
   ctx.fillStyle = grad; ctx.fill();
   ctx.beginPath();
-  up.forEach((b, i) => (i ? ctx.lineTo(x(b.t), y(b.p)) : ctx.moveTo(x(b.t), y(b.p))));
+  up.forEach((b, i) => (i ? ctx.lineTo(x(b.t), y(val(b))) : ctx.moveTo(x(b.t), y(val(b)))));
   ctx.strokeStyle = cUp; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.stroke();
 
   // Infobulle au survol
@@ -342,7 +390,7 @@ function drawChart() {
     const r = cv.getBoundingClientRect(), mx = e.clientX - r.left;
     let best = null, bd = 1e9;
     for (const b of pts) { const d = Math.abs(x(b.t) - mx); if (d < bd) { bd = d; best = b; } }
-    if (best && bd < 20) cv.dataset.tip = `<b>${fmtDate(best.t)}</b><br>${STATUS_LABEL[best.s]}${best.p != null ? ' · ' + best.p + ' ms' : ''}${best.m ? '<br>' + esc(best.m) : ''}`;
+    if (best && bd < 20) cv.dataset.tip = `<b>${fmtDate(best.t)}</b><br>${STATUS_LABEL[best.s]}${best.p != null ? ' · ' + best.p + ' ms' : ''}${best.pl != null ? ' · ' + best.pl + ' joueur(s)' : ''}${best.m ? '<br>' + esc(best.m) : ''}`;
     else delete cv.dataset.tip;
     cv.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, clientX: e.clientX, clientY: e.clientY }));
   };
@@ -383,11 +431,29 @@ function openMonitorForm(cfg = {}) {
         <div class="field"><label>Type de surveillance</label><select name="type">${Object.entries(TYPE_LABEL).map(([k, v]) => `<option value="${k}" ${c.type === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
         <div class="field"><label>Nom affiché</label><input name="name" required value="${esc(c.name || '')}" placeholder="Site web, API, Base de données…"></div>
       </div>
-      <div class="field t-http"><label>URL</label><input name="url" value="${esc(c.url || '')}" placeholder="https://craftpick.fr"></div>
+      <div class="field t-url"><label id="lbl-url">URL</label><input name="url" value="${esc(c.url || '')}" placeholder="https://craftpick.fr"></div>
       <div class="row t-host">
         <div class="field"><label>Nom d'hôte / IP</label><input name="hostname" value="${esc(c.hostname || '')}" placeholder="craftpick.fr ou 192.168.1.10"></div>
-        <div class="field t-tcp"><label>Port</label><input type="number" name="port" value="${c.port ?? ''}" placeholder="443"></div>
+        <div class="field t-port"><label>Port</label><input type="number" name="port" value="${c.port ?? ''}" placeholder="443"></div>
       </div>
+      <div class="row t-mc">
+        <div class="field"><label>Édition</label><select name="mcEdition"><option value="java" ${c.mcEdition !== 'bedrock' ? 'selected' : ''}>Java</option><option value="bedrock" ${c.mcEdition === 'bedrock' ? 'selected' : ''}>Bedrock</option></select></div>
+        <p class="muted small" style="margin:24px 0 0">Java : port vide = enregistrement SRV puis 25565. Bedrock : 19132 par défaut (UDP).</p>
+      </div>
+      <fieldset class="t-pve"><legend>Proxmox VE</legend>
+        <div class="row">
+          <div class="field"><label>Nom du nœud</label><input name="pveNode" value="${esc(c.pveNode || '')}" placeholder="pve"></div>
+          <div class="field"><label>ID du jeton API</label><input name="pveTokenId" value="${esc(c.pveTokenId || '')}" placeholder="root@pam!status" autocomplete="off"></div>
+        </div>
+        <div class="field"><label>Secret du jeton</label><input type="password" name="pveTokenSecret" value="" autocomplete="new-password" placeholder="${c.secretsSet && c.secretsSet.pveTokenSecret ? '•••••••• (laisser vide pour conserver)' : 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'}"></div>
+        <div class="field"><label>VM / CT à surveiller (IDs, panne si arrêtée)</label><input name="pveVmids" value="${esc(c.pveVmids || '')}" placeholder="100, 101, 105"></div>
+        <div class="row3">
+          <div class="field"><label>Seuil CPU (%)</label><input type="number" name="pveCpu" min="0" max="100" value="${c.pveCpu || ''}" placeholder="90"></div>
+          <div class="field"><label>Seuil RAM (%)</label><input type="number" name="pveMem" min="0" max="100" value="${c.pveMem || ''}" placeholder="90"></div>
+          <div class="field"><label>Seuil disque (%)</label><input type="number" name="pveDisk" min="0" max="100" value="${c.pveDisk || ''}" placeholder="85"></div>
+        </div>
+        <p class="muted small" style="margin-top:-4px">Un seuil dépassé passe le monitor en « Dégradé ». Jeton conseillé : rôle <code>PVEAuditor</code> (lecture seule) sur <code>/</code>.</p>
+      </fieldset>
       <div class="row t-dns">
         <div class="field"><label>Type d'enregistrement</label><select name="dnsType">${['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'SRV', 'CAA'].map((t) => `<option ${c.dnsType === t ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
         <div class="field"><label>Serveur DNS (optionnel)</label><input name="dnsServer" value="${esc(c.dnsServer || '')}" placeholder="1.1.1.1"></div>
@@ -425,11 +491,20 @@ function openMonitorForm(cfg = {}) {
         <div class="field"><label>Corps de la requête</label><textarea name="body">${esc(c.body || '')}</textarea></div>
         <div class="row">
           <div class="field"><label>Auth basique — utilisateur</label><input name="basicAuthUser" value="${esc(c.basicAuthUser || '')}" autocomplete="off"></div>
-          <div class="field"><label>Auth basique — mot de passe</label><input type="password" name="basicAuthPass" value="${esc(c.basicAuthPass || '')}" autocomplete="new-password"></div>
+          <div class="field"><label>Auth basique — mot de passe</label><input type="password" name="basicAuthPass" value="" autocomplete="new-password" placeholder="${c.secretsSet && c.secretsSet.basicAuthPass ? '•••••••• (laisser vide pour conserver)' : ''}"></div>
         </div>
-        <label class="check"><input type="checkbox" name="ignoreTls" ${c.ignoreTls ? 'checked' : ''}> Ignorer les erreurs de certificat TLS</label>
         <label class="check"><input type="checkbox" name="certExpiryAlert" ${c.certExpiryAlert ? 'checked' : ''}> Alerter avant expiration du certificat</label>
         <div class="field" style="max-width:220px"><label>Jours avant expiration</label><input type="number" name="certExpiryDays" value="${c.certExpiryDays}"></div>
+      </fieldset>
+
+      <label class="check t-tls" style="margin-bottom:14px"><input type="checkbox" name="ignoreTls" ${c.ignoreTls ? 'checked' : ''}> Ignorer les erreurs de certificat TLS <span class="muted small">(certificat auto-signé, ex. Proxmox)</span></label>
+
+      <fieldset><legend>Statut « Dégradé »</legend>
+        <div class="row">
+          <div class="field"><label>Seuil de temps de réponse (ms, 0 = désactivé)</label><input type="number" name="degradedMs" min="0" value="${c.degradedMs || 0}" placeholder="1500"></div>
+          <label class="check" style="margin-top:28px"><input type="checkbox" name="notifyDegraded" ${c.notifyDegraded ? 'checked' : ''}> Notifier aussi en cas de dégradation</label>
+        </div>
+        <p class="muted small" style="margin-top:-6px">Le service reste compté comme disponible, mais s'affiche en orange sur la page publique.</p>
       </fieldset>
 
       <fieldset><legend>Visibilité & notifications</legend>
@@ -451,23 +526,33 @@ function openMonitorForm(cfg = {}) {
     const t = form.type.value;
     const http = ['http', 'keyword', 'json'].includes(t);
     $$('.t-http', form).forEach((x) => x.classList.toggle('hidden', !http));
-    $$('.t-host', form).forEach((x) => x.classList.toggle('hidden', http || t === 'push'));
+    $$('.t-url', form).forEach((x) => x.classList.toggle('hidden', !http && t !== 'proxmox'));
+    $$('.t-tls', form).forEach((x) => x.classList.toggle('hidden', !http && t !== 'proxmox'));
+    $$('.t-host', form).forEach((x) => x.classList.toggle('hidden', http || t === 'push' || t === 'proxmox'));
+    $$('.t-port', form).forEach((x) => x.classList.toggle('hidden', t !== 'tcp' && t !== 'minecraft'));
+    $$('.t-mc', form).forEach((x) => x.classList.toggle('hidden', t !== 'minecraft'));
+    $$('.t-pve', form).forEach((x) => x.classList.toggle('hidden', t !== 'proxmox'));
+    $('#lbl-url', el).textContent = t === 'proxmox' ? 'URL de l’API Proxmox' : 'URL';
+    form.url.placeholder = t === 'proxmox' ? 'https://192.168.1.10:8006' : 'https://craftpick.fr';
+    form.port.placeholder = t === 'minecraft' ? (form.mcEdition.value === 'bedrock' ? '19132' : '25565 (ou SRV)') : '443';
+    if (t === 'proxmox' && !isEdit && !form.dataset.tlsSet) { form.ignoreTls.checked = true; form.dataset.tlsSet = '1'; }
     $$('.t-push', form).forEach((x) => x.classList.toggle('hidden', t !== 'push'));
     $$('.t-notpush', form).forEach((x) => x.classList.toggle('hidden', t === 'push'));
     $('#m-test', el).classList.toggle('hidden', t === 'push');
     $('#lbl-interval', el).textContent = t === 'push' ? 'Délai max entre deux push (s)' : 'Intervalle (s)';
-    $$('.t-tcp', form).forEach((x) => x.classList.toggle('hidden', t !== 'tcp'));
     $$('.t-dns', form).forEach((x) => x.classList.toggle('hidden', t !== 'dns'));
     $$('.t-keyword', form).forEach((x) => x.classList.toggle('hidden', t !== 'keyword'));
     $$('.t-json', form).forEach((x) => x.classList.toggle('hidden', t !== 'json'));
   };
-  form.type.onchange = sync; sync();
+  form.type.onchange = sync; form.mcEdition.onchange = sync; sync();
   const collect = () => { const d = formData(form); d.notificationIds ||= []; return d; };
   $('#m-test', el).onclick = async () => {
     $('#test-result').innerHTML = '<span class="muted">Test en cours…</span>';
     try {
       const r = await api('/api/monitors/test', { method: 'POST', body: collect() });
-      $('#test-result').innerHTML = r.ok ? `<span style="color:var(--up)">✓ OK — ${esc(r.msg)} (${r.ping} ms)</span>` : `<span style="color:var(--down)">✗ ${esc(r.msg)}</span>`;
+      $('#test-result').innerHTML = !r.ok ? `<span style="color:var(--down)">✗ ${esc(r.msg)}</span>`
+        : r.degraded ? `<span style="color:var(--degraded)">◐ Dégradé — ${esc(r.msg)} (${r.ping} ms)</span>`
+        : `<span style="color:var(--up)">✓ OK — ${esc(r.msg)} (${r.ping} ms)</span>`;
     } catch (e) { $('#test-result').innerHTML = `<span style="color:var(--down)">✗ ${esc(e.message)}</span>`; }
   };
   form.onsubmit = async (e) => {
@@ -588,6 +673,80 @@ function notifForm(n) {
     e.preventDefault();
     try { await api(isEdit ? '/api/notifications/' + n.id : '/api/notifications', { method: isEdit ? 'PUT' : 'POST', body: collect() }); toast('Notification enregistrée'); openNotifications(); }
     catch (err) { toast(err.message, true); }
+  };
+}
+
+// Pages de status
+async function openPages() {
+  pages = await api('/api/pages');
+  const el = modal(`
+    <div class="panel-head"><h2 style="margin:0">Pages de status</h2><button class="btn primary" id="p-new">＋ Nouvelle page</button></div>
+    <p class="muted small" style="margin-top:0">La page principale (<a href="/" target="_blank">/</a>) affiche les monitors publics. Crée des pages dédiées — par exemple « joueurs » ou « infra » — avec leur propre sélection de services, éventuellement protégées par mot de passe.</p>
+    ${pages.length ? pages.map((p) => `<div class="list-item">
+      <div style="min-width:0"><b>${p.protected ? '🔒 ' : ''}${esc(p.title)}</b>
+        <div class="small muted"><a href="/s/${esc(p.slug)}" target="_blank">/s/${esc(p.slug)}</a> · ${p.monitorIds.length} service(s)</div></div>
+      <div class="actions"><button class="btn sm" data-edit="${p.id}">Modifier</button><button class="btn sm danger" data-del="${p.id}">✕</button></div>
+    </div>`).join('') : '<p class="muted">Aucune page dédiée pour le moment.</p>'}
+    <div class="modal-foot"><button class="btn" onclick="closeModal()">Fermer</button></div>`, true);
+  $('#p-new', el).onclick = () => pageForm();
+  $$('[data-edit]', el).forEach((b) => (b.onclick = () => pageForm(pages.find((p) => p.id === Number(b.dataset.edit)))));
+  $$('[data-del]', el).forEach((b) => (b.onclick = async () => { if (confirm('Supprimer cette page ? Les monitors ne sont pas supprimés.')) { await api('/api/pages/' + b.dataset.del, { method: 'DELETE' }); openPages(); } }));
+}
+function pageForm(p) {
+  const isEdit = !!p;
+  p = { monitorIds: [], ...(p || {}) };
+  const sel = new Set(p.monitorIds);
+  // Ordre d'affichage : d'abord ceux de la page dans leur ordre, puis les autres
+  const ordered = [...p.monitorIds.map((id) => monitors.find((m) => m.id === id)).filter(Boolean), ...monitors.filter((m) => !sel.has(m.id))];
+  const el = modal(`
+    <h2>${isEdit ? 'Modifier la page' : 'Nouvelle page de status'}</h2>
+    <form id="pform">
+      <div class="row">
+        <div class="field"><label>Titre</label><input name="title" required value="${esc(p.title || '')}" placeholder="Craftpick — Joueurs"></div>
+        <div class="field"><label>Adresse</label><div style="display:flex;align-items:center;gap:6px"><span class="muted small">/s/</span><input name="slug" required pattern="[a-z0-9][a-z0-9\\-]{0,39}" value="${esc(p.slug || '')}" placeholder="joueurs"></div></div>
+      </div>
+      <div class="field"><label>Description</label><input name="description" value="${esc(p.description || '')}"></div>
+      <div class="row">
+        <div class="field"><label>URL du logo (optionnel)</label><input name="logoUrl" value="${esc(p.logoUrl || '')}"></div>
+        <div class="field"><label>Pied de page (optionnel)</label><input name="footer" value="${esc(p.footer || '')}"></div>
+      </div>
+      <fieldset><legend>Services affichés (dans cet ordre)</legend>
+        ${ordered.length ? ordered.map((m) => `<div class="check" style="justify-content:space-between" data-mid="${m.id}">
+          <label class="check" style="margin:0;flex:1"><input type="checkbox" data-pm="${m.id}" ${sel.has(m.id) ? 'checked' : ''}> <span class="dot s${m.status}" style="animation:none"></span> ${esc(m.name)} <span class="muted small">${esc(TYPE_LABEL[m.type])}${m.config.isPublic ? '' : ' · privé'}</span></label>
+          <span><button type="button" class="btn sm ghost" data-up="${m.id}" title="Monter">↑</button><button type="button" class="btn sm ghost" data-down="${m.id}" title="Descendre">↓</button></span>
+        </div>`).join('') : '<p class="muted small">Aucun monitor.</p>'}
+        <p class="muted small">Un monitor « privé » (non public) peut quand même apparaître ici : pratique pour une page interne protégée.</p>
+      </fieldset>
+      <fieldset><legend>Protection</legend>
+        <div class="field"><label>${p.protected ? 'Nouveau mot de passe (laisser vide pour conserver)' : 'Mot de passe (laisser vide = page publique)'}</label><input type="password" name="password" autocomplete="new-password"></div>
+        ${p.protected ? '<label class="check"><input type="checkbox" name="removePassword"> Retirer la protection</label>' : ''}
+      </fieldset>
+      <div class="modal-foot"><button type="button" class="btn ghost" id="p-back">Retour</button><button class="btn primary" type="submit">Enregistrer</button></div>
+    </form>`);
+  const form = $('#pform', el);
+  if (!isEdit) form.elements.title.oninput = () => { if (!form.slug.dataset.touched) form.slug.value = form.elements.title.value.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40); };
+  form.slug.oninput = () => (form.slug.dataset.touched = '1');
+  // Réordonner
+  el.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-up],[data-down]');
+    if (!b) return;
+    const row = b.closest('[data-mid]');
+    if (b.dataset.up && row.previousElementSibling && row.previousElementSibling.dataset.mid) row.parentNode.insertBefore(row, row.previousElementSibling);
+    if (b.dataset.down && row.nextElementSibling && row.nextElementSibling.dataset.mid) row.parentNode.insertBefore(row.nextElementSibling, row);
+  });
+  $('#p-back', el).onclick = openPages;
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const d = {
+      title: form.elements.title.value, slug: form.slug.value, description: form.description.value, logoUrl: form.logoUrl.value, footer: form.footer.value,
+      password: form.password.value, removePassword: form.removePassword ? form.removePassword.checked : false,
+      monitorIds: $$('[data-pm]', form).filter((c) => c.checked).map((c) => Number(c.dataset.pm)),
+    };
+    try {
+      await api(isEdit ? '/api/pages/' + p.id : '/api/pages', { method: isEdit ? 'PUT' : 'POST', body: d });
+      toast('Page enregistrée');
+      openPages();
+    } catch (err) { toast(err.message, true); }
   };
 }
 

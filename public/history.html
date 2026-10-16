@@ -19,7 +19,10 @@
   </div>
   <script src="/common.js"></script>
   <script>
-    api('/api/incidents/history').then((list) => {
+    const PAGE = (location.pathname.match(/^\/s\/([a-z0-9-]+)/i) || [])[1] || null;
+    const home = PAGE ? '/s/' + PAGE : '/';
+    $$('a[href="/"]').forEach((a) => (a.href = home));
+    api('/api/incidents/history' + (PAGE ? '?page=' + encodeURIComponent(PAGE) : '')).then((list) => {
       if (!list.length) { $('#list').innerHTML = '<div class="card" style="padding:20px"><span class="muted">Aucun incident enregistré.</span></div>'; return; }
       const byMonth = {};
       for (const i of list) (byMonth[new Date(i.createdAt).toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' })] ||= []).push(i);
@@ -31,7 +34,11 @@
           ${(i.updates || []).slice().reverse().map((u) => `<div class="upd"><b>${esc(INC_STATUS[u.status] || u.status)}</b> — <span class="when">${fmtDate(u.at)}</span><p>${esc(u.text)}</p></div>`).join('')}
         </div>`;
       }).join('')).join('');
-    }).catch(() => { $('#list').innerHTML = '<p class="muted">Erreur de chargement.</p>'; });
+    }).catch((e) => {
+      $('#list').innerHTML = e.status === 401
+        ? `<div class="card" style="padding:20px">🔒 Page protégée. <a href="${home}">Déverrouille-la d'abord</a>.</div>`
+        : '<p class="muted">Erreur de chargement.</p>';
+    });
   </script>
 </body>
 </html>
