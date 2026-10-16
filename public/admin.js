@@ -5,7 +5,15 @@ let selectedId = null;
 let chartHours = 24;
 let chartBeats = [];
 
-const TYPE_LABEL = { http: 'HTTP(S)', keyword: 'HTTP(S) — Mot-clé', json: 'HTTP(S) — Requête JSON', tcp: 'Port TCP', ping: 'Ping', dns: 'DNS' };
+const TYPE_LABEL = { http: 'HTTP(S)', keyword: 'HTTP(S) — Mot-clé', json: 'HTTP(S) — Requête JSON', tcp: 'Port TCP', ping: 'Ping', dns: 'DNS', push: 'Push (heartbeat)' };
+
+// Alertes du navigateur quand un monitor change d'état
+function browserAlert(m, beat) {
+  try {
+    if (localStorage.getItem('cs-browser-alerts') !== '1' || !('Notification' in window) || Notification.permission !== 'granted') return;
+    new Notification(`${beat.s === 1 ? '✅' : '🔴'} ${m.name} — ${STATUS_LABEL[beat.s]}`, { body: beat.m || '', icon: '/favicon.svg', tag: 'cs-' + m.id });
+  } catch {}
+}
 
 // ───────────── Authentification ─────────────
 async function init() {
@@ -46,7 +54,26 @@ async function startApp() {
   setInterval(loadMonitors, 30000);
 }
 
-$('#logout').onclick = async () => { await api('/api/logout', { method: 'POST' }); location.reload(); };
+// Bouton d'alertes navigateur
+(function () {
+  const btn = $('#browser-alerts');
+  if (!btn) return;
+  if (!('Notification' in window)) { btn.classList.add('hidden'); return; }
+  const on = () => { try { return localStorage.getItem('cs-browser-alerts') === '1' && Notification.permission === 'granted'; } catch { return false; } };
+  const paint = () => { btn.textContent = on() ? '🔔 Alertes : oui' : '🔕 Alertes : non'; btn.title = 'Notifications du navigateur quand un monitor change d’état'; };
+  btn.onclick = async () => {
+    if (on()) { try { localStorage.setItem('cs-browser-alerts', '0'); } catch {} }
+    else {
+      const p = await Notification.requestPermission();
+      if (p !== 'granted') toast('Autorisation refusée par le navigateur', true);
+      try { localStorage.setItem('cs-browser-alerts', p === 'granted' ? '1' : '0'); } catch {}
+    }
+    paint();
+  };
+  paint();
+})();
+
+$('#logout').onclick =async () => { await api('/api/logout', { method: 'POST' }); location.reload(); };
 $('#add-monitor').onclick = () => openMonitorForm();
 $('#search').oninput = renderList;
 $$('[data-open]').forEach((b) => (b.onclick = () => ({ incidents: openIncidents, notifications: openNotifications, settings: openSettings })[b.dataset.open]()));
@@ -76,7 +103,10 @@ function onBeat({ monitorId, beat }) {
   m.ping = beat.p;
   m.lastMsg = beat.m;
   if (monitorId === selectedId && Date.now() - beat.t < chartHours * 3600e3) { chartBeats.push(beat); }
-  if (changed) { clearTimeout(reloadTimer); reloadTimer = setTimeout(loadMonitors, 400); }
+  if (changed) {
+    if ((beat.s === 0 || beat.s === 1) && m.status !== undefined) browserAlert(m, beat);
+    clearTimeout(reloadTimer); reloadTimer = setTimeout(loadMonitors, 400);
+  }
   renderList();
   if (monitorId === selectedId) renderDetail(false);
   else if (!selectedId) renderDashboard();
@@ -152,7 +182,7 @@ function renderDetail(full = true) {
             ${m.config.isPublic ? '<span class="pill s-1">Public</span>' : '<span class="pill s-1">Privé</span>'}
           </div>
           <div style="margin-top:6px">${/^https?:/.test(m.target) ? `<a class="tgt" href="${esc(m.target)}" target="_blank" rel="noopener">${esc(m.target)}</a>` : `<span class="tgt">${esc(m.target)}</span>`}
-            <span class="muted small"> · ${esc(TYPE_LABEL[m.type])} · toutes les ${m.config.interval} s</span></div>
+            <span class="muted small"> · ${esc(TYPE_LABEL[m.type])} · ${m.type === 'push' ? 'push attendu' : ''} toutes les ${m.config.interval} s</span></div>
           ${m.lastMsg ? `<div class="muted small" style="margin-top:4px">Dernier résultat : ${esc(m.lastMsg)}</div>` : ''}
         </div>
         <div class="actions">
@@ -194,7 +224,13 @@ function renderDetail(full = true) {
       <div class="panel-head"><h3>Badge</h3></div>
       <p class="muted small" style="margin-top:0">À intégrer dans un README ou un site (monitor public uniquement) :</p>
       <input readonly value="${esc(location.origin)}/api/badge/${m.id}" onclick="this.select()">
-    </div>`;
+    </div>
+    ${m.type === 'push' ? `<div class="card panel">
+      <div class="panel-head"><h3>URL de push</h3></div>
+      <p class="muted small" style="margin-top:0">Ton service (cron, script, serveur de jeu…) doit appeler cette URL au moins toutes les ${m.config.interval} s. Paramètres optionnels : <code>status=down</code>, <code>msg=…</code>, <code>ping=…</code>.</p>
+      <input readonly value="${esc(location.origin + m.pushPath)}?status=up&amp;msg=OK" onclick="this.select()">
+      <p class="muted small">Exemple cron Linux : <code>*/1 * * * * curl -fsS "${esc(location.origin + m.pushPath)}" &gt;/dev/null</code></p>
+    </div>` : ''}`;
 
   if (!full && $('#chart')) {
     // mise à jour légère : on ne refait que le haut et le graphe
@@ -217,7 +253,7 @@ function renderDetail(full = true) {
 function bindDetail(m) {
   $('#d-toggle').onclick = async () => { await api(`/api/monitors/${m.id}/toggle`, { method: 'POST' }); loadMonitors(); };
   $('#d-edit').onclick = () => openMonitorForm(m.config);
-  $('#d-clone').onclick = () => openMonitorForm({ ...m.config, id: undefined, name: m.config.name + ' (copie)' });
+  $('#d-clone').onclick = () => openMonitorForm({ ...m.config, id: undefined, pushToken: undefined, name: m.config.name + ' (copie)' });
   $('#d-del').onclick = async () => {
     if (!confirm(`Supprimer « ${m.name} » et tout son historique ?`)) return;
     await api(`/api/monitors/${m.id}`, { method: 'DELETE' });
@@ -362,14 +398,20 @@ function openMonitorForm(cfg = {}) {
         <div class="field"><label>Chemin JSON</label><input name="jsonPath" value="${esc(c.jsonPath || '')}" placeholder="status ou data.health"></div>
         <div class="field"><label>Valeur attendue</label><input name="jsonExpected" value="${esc(c.jsonExpected || '')}" placeholder="ok"></div>
       </div>
+      <div class="field t-push"><label>URL de push</label>
+        ${c.pushToken ? `<input readonly value="${esc(location.origin)}/api/push/${esc(c.pushToken)}" onclick="this.select()">` : '<p class="muted small" style="margin:0">L’URL sera générée à la création. Ton service devra l’appeler régulièrement ; sans appel dans l’intervalle, le monitor passe hors ligne.</p>'}
+      </div>
 
       <div class="row3">
-        <div class="field"><label>Intervalle (s)</label><input type="number" name="interval" min="10" value="${c.interval}"></div>
-        <div class="field"><label>Tentatives avant alerte</label><input type="number" name="retries" min="0" max="10" value="${c.retries}"></div>
-        <div class="field"><label>Intervalle en panne (s)</label><input type="number" name="retryInterval" min="10" value="${c.retryInterval}"></div>
+        <div class="field"><label id="lbl-interval">Intervalle (s)</label><input type="number" name="interval" min="10" value="${c.interval}"></div>
+        <div class="field t-notpush"><label>Tentatives avant alerte</label><input type="number" name="retries" min="0" max="10" value="${c.retries}"></div>
+        <div class="field t-notpush"><label>Intervalle en panne (s)</label><input type="number" name="retryInterval" min="10" value="${c.retryInterval}"></div>
       </div>
       <div class="row">
-        <div class="field"><label>Délai d'expiration (s)</label><input type="number" name="timeout" min="1" max="300" value="${c.timeout}"></div>
+        <div class="field t-notpush"><label>Délai d'expiration (s)</label><input type="number" name="timeout" min="1" max="300" value="${c.timeout}"></div>
+        <div class="field"><label>Rappel en panne (toutes les N vérifications, 0 = jamais)</label><input type="number" name="resendEvery" min="0" value="${c.resendEvery || 0}"></div>
+      </div>
+      <div class="row">
         <div class="field"><label>Groupe (page publique)</label><input name="group" list="groups" value="${esc(c.group || '')}" placeholder="Services"><datalist id="groups">${groups.map((g) => `<option value="${esc(g)}">`).join('')}</datalist></div>
       </div>
       <div class="field"><label>Description (affichée publiquement)</label><input name="description" value="${esc(c.description || '')}"></div>
@@ -381,6 +423,10 @@ function openMonitorForm(cfg = {}) {
         </div>
         <div class="field"><label>En-têtes (JSON)</label><textarea name="headers" placeholder='{"Authorization": "Bearer …"}'>${esc(c.headers || '')}</textarea></div>
         <div class="field"><label>Corps de la requête</label><textarea name="body">${esc(c.body || '')}</textarea></div>
+        <div class="row">
+          <div class="field"><label>Auth basique — utilisateur</label><input name="basicAuthUser" value="${esc(c.basicAuthUser || '')}" autocomplete="off"></div>
+          <div class="field"><label>Auth basique — mot de passe</label><input type="password" name="basicAuthPass" value="${esc(c.basicAuthPass || '')}" autocomplete="new-password"></div>
+        </div>
         <label class="check"><input type="checkbox" name="ignoreTls" ${c.ignoreTls ? 'checked' : ''}> Ignorer les erreurs de certificat TLS</label>
         <label class="check"><input type="checkbox" name="certExpiryAlert" ${c.certExpiryAlert ? 'checked' : ''}> Alerter avant expiration du certificat</label>
         <div class="field" style="max-width:220px"><label>Jours avant expiration</label><input type="number" name="certExpiryDays" value="${c.certExpiryDays}"></div>
@@ -405,7 +451,11 @@ function openMonitorForm(cfg = {}) {
     const t = form.type.value;
     const http = ['http', 'keyword', 'json'].includes(t);
     $$('.t-http', form).forEach((x) => x.classList.toggle('hidden', !http));
-    $$('.t-host', form).forEach((x) => x.classList.toggle('hidden', http));
+    $$('.t-host', form).forEach((x) => x.classList.toggle('hidden', http || t === 'push'));
+    $$('.t-push', form).forEach((x) => x.classList.toggle('hidden', t !== 'push'));
+    $$('.t-notpush', form).forEach((x) => x.classList.toggle('hidden', t === 'push'));
+    $('#m-test', el).classList.toggle('hidden', t === 'push');
+    $('#lbl-interval', el).textContent = t === 'push' ? 'Délai max entre deux push (s)' : 'Intervalle (s)';
     $$('.t-tcp', form).forEach((x) => x.classList.toggle('hidden', t !== 'tcp'));
     $$('.t-dns', form).forEach((x) => x.classList.toggle('hidden', t !== 'dns'));
     $$('.t-keyword', form).forEach((x) => x.classList.toggle('hidden', t !== 'keyword'));
@@ -497,6 +547,8 @@ const NOTIF_FIELDS = {
   slack: [['webhookUrl', 'URL du webhook Slack', 'https://hooks.slack.com/services/…']],
   telegram: [['botToken', 'Token du bot', '123456:ABC…'], ['chatId', 'Chat ID', '-1001234567']],
   ntfy: [['server', 'Serveur', 'https://ntfy.sh'], ['topic', 'Topic', 'craftpick-alertes']],
+  gotify: [['server', 'URL du serveur Gotify', 'https://gotify.exemple.fr'], ['token', "Jeton d'application", 'AbC…']],
+  pushover: [['token', "Jeton d'application (API token)", 'azGDORePK8gMaC0…'], ['userKey', 'Clé utilisateur', 'uQiRzpo4DXghDmr…']],
   webhook: [['url', 'URL (POST JSON)', 'https://exemple.fr/hook']],
 };
 async function openNotifications() {

@@ -1,0 +1,4 @@
+node_modules/
+# Données locales : contient le hash du mot de passe admin, les sessions et la config des monitors
+data/
+*.log

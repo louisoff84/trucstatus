@@ -37,6 +37,29 @@ function beatBarsHTML(beats, n = 40) {
   return pad + list.map((b) => `<i class="b${b.s}" data-tip="${esc(`<b>${fmtDate(b.t)}</b><br>${STATUS_LABEL[b.s]}${b.p != null ? ` · ${b.p} ms` : ''}${b.m ? `<br>${esc(b.m)}` : ''}`)}"></i>`).join('');
 }
 
+// Thème : auto → clair → sombre (mémorisé dans le navigateur)
+(function () {
+  const root = document.documentElement;
+  const get = () => { try { return localStorage.getItem('cs-theme') || 'auto'; } catch { return 'auto'; } };
+  const apply = (t) => { if (t === 'auto') root.removeAttribute('data-theme'); else root.setAttribute('data-theme', t); };
+  apply(get());
+  const label = { auto: '🌓', light: '☀️', dark: '🌙' };
+  const title = { auto: 'Thème : automatique', light: 'Thème : clair', dark: 'Thème : sombre' };
+  const init = () => {
+    document.querySelectorAll('.theme-toggle').forEach((b) => {
+      const paint = () => { b.textContent = label[get()]; b.title = title[get()]; };
+      paint();
+      b.addEventListener('click', () => {
+        const next = { auto: 'light', light: 'dark', dark: 'auto' }[get()];
+        try { localStorage.setItem('cs-theme', next); } catch {}
+        apply(next); paint();
+        if (typeof drawChart === 'function') drawChart();
+      });
+    });
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+})();
+
 // Infobulles
 (function () {
   let tip;

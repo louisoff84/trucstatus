@@ -36,6 +36,7 @@ function render() {
     const activeInc = s.incidents.filter((i) => i.status !== 'resolved' && i.severity !== 'maintenance');
     let cls = 'ok', ic = '✓', txt = 'Tous les systèmes sont opérationnels';
     if (!ms.length) { cls = 'empty'; ic = '…'; txt = 'Aucun service surveillé pour le moment'; }
+    else if (ms.every((m) => m.status === 2)) { cls = 'empty'; ic = '…'; txt = 'Vérification des services en cours…'; }
     else if (down && down >= Math.ceil(ms.length / 2)) { cls = 'major'; ic = '!'; txt = 'Panne majeure en cours'; }
     else if (down || activeInc.some((i) => i.severity === 'danger')) { cls = 'partial'; ic = '!'; txt = `Perturbation partielle — ${down} service${down > 1 ? 's' : ''} hors ligne`; }
     else if (activeInc.length) { cls = 'partial'; ic = '!'; txt = 'Certains services sont dégradés'; }
@@ -51,9 +52,11 @@ function render() {
   const groups = {};
   for (const m of s.monitors) (groups[m.group || 'Services'] ||= []).push(m);
   $('#groups').innerHTML = Object.entries(groups).map(([g, list]) => {
-    const allUp = list.every((m) => m.status === 1 || m.status === 3);
+    const anyDown = list.some((m) => m.status === 0);
+    const anyPending = list.some((m) => m.status === 2);
+    const [gc, gl] = anyDown ? ['s0', 'Perturbé'] : anyPending ? ['s2', 'Vérification…'] : ['s1', 'Opérationnel'];
     return `<div class="card group">
-      <div class="group-head"><span>${esc(g)}</span><span class="pill ${allUp ? 's1' : 's0'}">${allUp ? 'Opérationnel' : 'Perturbé'}</span></div>
+      <div class="group-head"><span>${esc(g)}</span><span class="pill ${gc}">${gl}</span></div>
       ${list.map((m) => `<div class="svc" data-id="${m.id}">
         <div class="svc-top">
           <div class="svc-name"><span class="dot s${m.status}"></span><span>${esc(m.name)}</span></div>

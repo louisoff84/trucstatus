@@ -14,9 +14,29 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 db.load();
 
 // ───────────────────────── Auth ─────────────────────────
-const sessions = new Map(); // token -> expiresAt
+// Sessions persistées (hash SHA-256 du jeton -> expiration) : on reste connecté après un redémarrage
 const SESSION_MS = 30 * 24 * 3600 * 1000;
+const TRUST_PROXY = process.env.TRUST_PROXY === '1' || process.env.TRUST_PROXY === 'true';
 const loginAttempts = new Map(); // ip -> {n, until}
+db.data.sessions ||= {};
+const sha = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
+const sessions = {
+  get: (t) => db.data.sessions[sha(t)],
+  set: (t, exp) => { db.data.sessions[sha(t)] = exp; db.save(); },
+  delete: (t) => { if (t) { delete db.data.sessions[sha(t)]; db.save(); } },
+  clear: () => { db.data.sessions = {}; db.save(); },
+};
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, exp] of Object.entries(db.data.sessions)) if (exp < now) delete db.data.sessions[k];
+}, 3600e3).unref();
+function clientIp(req) {
+  if (TRUST_PROXY && req.headers['x-forwarded-for']) return String(req.headers['x-forwarded-for']).split(',')[0].trim();
+  return req.socket.remoteAddress;
+}
+function isHttps(req) {
+  return req.socket.encrypted || (TRUST_PROXY && String(req.headers['x-forwarded-proto'] || '').startsWith('https'));
+}
 
 function hashPassword(pw, salt) {
   return crypto.scryptSync(pw, salt, 64).toString('hex');
@@ -49,10 +69,10 @@ function isAuthed(req) {
   if (exp < Date.now()) { sessions.delete(t); return false; }
   return true;
 }
-function newSession(res) {
+function newSession(req, res) {
   const t = crypto.randomBytes(32).toString('hex');
   sessions.set(t, Date.now() + SESSION_MS);
-  res.setHeader('Set-Cookie', `cs_session=${t}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_MS / 1000}`);
+  res.setHeader('Set-Cookie', `cs_session=${t}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_MS / 1000}${isHttps(req) ? '; Secure' : ''}`);
 }
 
 // ───────────────────────── Helpers ─────────────────────────
@@ -72,7 +92,7 @@ function readBody(req) {
 const clamp = (v, min, max, def) => { const n = Number(v); return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def; };
 const str = (v, max = 500) => (v == null ? '' : String(v).slice(0, max));
 
-const MONITOR_TYPES = ['http', 'keyword', 'json', 'tcp', 'ping', 'dns'];
+const MONITOR_TYPES = ['http', 'keyword', 'json', 'tcp', 'ping', 'dns', 'push'];
 function sanitizeMonitor(b, existing = {}) {
   const m = {
     ...existing,
@@ -105,6 +125,11 @@ function sanitizeMonitor(b, existing = {}) {
     showTarget: !!b.showTarget,
     notificationIds: Array.isArray(b.notificationIds) ? b.notificationIds.map(Number).filter(Number.isFinite) : [],
     active: b.active !== false,
+    resendEvery: clamp(b.resendEvery, 0, 1000, 0),
+    basicAuthUser: str(b.basicAuthUser, 200),
+    basicAuthPass: str(b.basicAuthPass, 200),
+    pushToken: existing.pushToken
+      || (/^[A-Za-z0-9]{16,64}$/.test(b.pushToken || '') && !db.data.monitors.some((x) => x.pushToken === b.pushToken) ? b.pushToken : crypto.randomBytes(16).toString('hex')),
   };
   if (['http', 'keyword', 'json'].includes(m.type) && !/^https?:\/\//i.test(m.url)) throw new Error("L'URL doit commencer par http:// ou https://");
   if (['tcp', 'ping', 'dns'].includes(m.type) && !m.hostname) throw new Error('Nom d’hôte requis');
@@ -153,6 +178,7 @@ function currentStatus(m) {
 }
 function target(m) {
   if (['http', 'keyword', 'json'].includes(m.type)) return m.url;
+  if (m.type === 'push') return 'Push (heartbeat)';
   return m.hostname + (m.port && m.type === 'tcp' ? ':' + m.port : '');
 }
 function monitorSummary(m, admin) {
@@ -168,7 +194,7 @@ function monitorSummary(m, admin) {
     recent: (db.data.beats[m.id] || []).slice(-60).map((b) => ({ t: b.t, s: b.s, p: b.p, ...(admin ? { m: b.m } : {}) })),
   };
   if (admin || m.showTarget) base.target = target(m);
-  if (admin) Object.assign(base, { config: m, cert: st.cert || null, lastMsg: st.lastBeat ? st.lastBeat.m : null });
+  if (admin) Object.assign(base, { config: m, cert: st.cert || null, lastMsg: st.lastBeat ? st.lastBeat.m : null, pushPath: `/api/push/${m.pushToken}` });
   return base;
 }
 function publicIncident(i) {
@@ -233,6 +259,36 @@ route('GET', '/api/events', (req, res) => {
   req.on('close', () => clients.delete(c));
 });
 
+// Push (heartbeat) : GET ou POST /api/push/<token>?status=up|down&msg=...&ping=...
+async function handlePush(req, res, p, q) {
+  const m = db.data.monitors.find((x) => x.type === 'push' && x.pushToken === p.token);
+  if (!m) return send(res, 404, { ok: false, error: 'Jeton inconnu' });
+  if (!m.active) return send(res, 200, { ok: false, error: 'Monitor en pause' });
+  let body = {};
+  if (req.method === 'POST') body = await readBody(req).catch(() => ({}));
+  const status = String(q.get('status') || body.status || 'up').toLowerCase();
+  monitor.receivePush(m, { status: status === 'down' ? 'down' : 'up', msg: q.get('msg') || body.msg, ping: q.get('ping') ?? body.ping });
+  send(res, 200, { ok: true });
+}
+route('GET', '/api/push/:token', handlePush);
+route('POST', '/api/push/:token', handlePush);
+
+// Santé du serveur (pour Docker / un autre outil de monitoring)
+route('GET', '/api/health', (req, res) => send(res, 200, { ok: true, uptime: Math.round(process.uptime()), monitors: db.data.monitors.length }));
+
+// Flux RSS des incidents
+const xml = (s) => String(s ?? '').replace(/[<>&'"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' }[c]));
+route('GET', '/api/feed.xml', (req, res) => {
+  const s = db.data.settings;
+  const base = `${isHttps(req) ? 'https' : 'http'}://${req.headers.host || 'localhost'}`;
+  const items = db.data.incidents.slice().sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 50).map((i) => {
+    const last = (i.updates || []).slice(-1)[0];
+    return `<item><title>${xml(i.title)}</title><link>${base}/history#i-${i.id}</link><guid isPermaLink="false">incident-${i.id}-${xml(i.updatedAt || i.createdAt)}</guid><pubDate>${new Date(i.updatedAt || i.createdAt).toUTCString()}</pubDate><description>${xml(`[${i.status}] ${last ? last.text : i.content}`)}</description></item>`;
+  }).join('');
+  res.writeHead(200, { 'Content-Type': 'application/rss+xml; charset=utf-8' });
+  res.end(`<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>${xml(s.title)} — Incidents</title><link>${base}/</link><description>${xml(s.description)}</description>${items}</channel></rss>`);
+});
+
 // Auth
 route('GET', '/api/me', (req, res) => send(res, 200, { authed: isAuthed(req), setup: !db.data.settings.adminHash }));
 route('POST', '/api/setup', async (req, res) => {
@@ -240,11 +296,11 @@ route('POST', '/api/setup', async (req, res) => {
   const b = await readBody(req);
   if (!b.password || String(b.password).length < 8) return send(res, 400, { error: 'Mot de passe : 8 caractères minimum' });
   setPassword(String(b.password));
-  newSession(res);
+  newSession(req, res);
   send(res, 200, { ok: true });
 });
 route('POST', '/api/login', async (req, res) => {
-  const ip = req.socket.remoteAddress;
+  const ip = clientIp(req);
   const a = loginAttempts.get(ip) || { n: 0, until: 0 };
   if (a.until > Date.now()) return send(res, 429, { error: 'Trop de tentatives, réessaie dans quelques minutes' });
   const b = await readBody(req);
@@ -255,7 +311,7 @@ route('POST', '/api/login', async (req, res) => {
     return send(res, 401, { error: 'Mot de passe incorrect' });
   }
   loginAttempts.delete(ip);
-  newSession(res);
+  newSession(req, res);
   send(res, 200, { ok: true });
 });
 route('POST', '/api/logout', (req, res) => {
@@ -357,7 +413,7 @@ route('DELETE', '/api/incidents/:id', (req, res, p) => {
 }, true);
 
 // Notifications (admin)
-const NTYPES = ['discord', 'slack', 'telegram', 'webhook', 'ntfy'];
+const NTYPES = ['discord', 'slack', 'telegram', 'webhook', 'ntfy', 'gotify', 'pushover'];
 function sanitizeNotif(b, existing = {}) {
   const c = b.config || {};
   return {
@@ -366,7 +422,7 @@ function sanitizeNotif(b, existing = {}) {
     type: NTYPES.includes(b.type) ? b.type : 'webhook',
     applyAll: !!b.applyAll,
     active: b.active !== false,
-    config: { webhookUrl: str(c.webhookUrl, 1000), username: str(c.username, 100), botToken: str(c.botToken, 200), chatId: str(c.chatId, 100), url: str(c.url, 1000), server: str(c.server, 500), topic: str(c.topic, 200) },
+    config: { webhookUrl: str(c.webhookUrl, 1000), username: str(c.username, 100), botToken: str(c.botToken, 200), chatId: str(c.chatId, 100), url: str(c.url, 1000), server: str(c.server, 500), topic: str(c.topic, 200), token: str(c.token, 200), userKey: str(c.userKey, 200) },
   };
 }
 route('GET', '/api/notifications', (req, res) => send(res, 200, db.data.notifications), true);
@@ -414,7 +470,7 @@ route('PUT', '/api/settings', async (req, res) => {
     if (String(b.newPassword).length < 8) return send(res, 400, { error: 'Nouveau mot de passe : 8 caractères minimum' });
     setPassword(String(b.newPassword));
     sessions.clear();
-    newSession(res);
+    newSession(req, res);
   }
   db.save(); broadcastRefresh();
   send(res, 200, { ok: true });
@@ -467,7 +523,7 @@ const server = http.createServer(async (req, res) => {
       if (!match) continue;
       if (r.auth && !isAuthed(req)) return send(res, 401, { error: 'Non authentifié' });
       // Protection CSRF basique : les mutations doivent venir d'un fetch JSON
-      if (req.method !== 'GET' && !String(req.headers['content-type'] || '').includes('application/json') && !['/api/logout'].includes(url.pathname)) {
+      if (req.method !== 'GET' && !String(req.headers['content-type'] || '').includes('application/json') && url.pathname !== '/api/logout' && !url.pathname.startsWith('/api/push/')) {
         return send(res, 415, { error: 'Content-Type application/json requis' });
       }
       const params = {};

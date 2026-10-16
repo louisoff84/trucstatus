@@ -19,7 +19,10 @@
           <p id="desc"></p>
         </div>
       </div>
-      <a class="btn sm ghost muted" href="/history">Historique</a>
+      <div style="display:flex;gap:4px">
+        <a class="btn sm ghost" href="/history">Historique</a>
+        <button class="btn sm ghost theme-toggle" title="Thème">🌓</button>
+      </div>
     </header>
 
     <div id="overall" class="overall empty"><div class="ic">…</div><div>Chargement…</div></div>
@@ -30,7 +33,7 @@
     <footer class="pub-footer">
       <div id="updated">—</div>
       <div id="footer-text" style="margin-top:6px"></div>
-      <div style="margin-top:10px"><a href="/admin">Administration</a></div>
+      <div style="margin-top:10px"><a href="/api/feed.xml">Flux RSS des incidents</a> · <a href="/admin">Administration</a></div>
     </footer>
   </div>
   <script src="/common.js"></script>

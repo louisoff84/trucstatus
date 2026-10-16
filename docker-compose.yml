@@ -1,0 +1,13 @@
+services:
+  status:
+    build: .
+    container_name: craftpick-status
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TZ=Europe/Paris
+      # Mettre à 1 si l'app est derrière un reverse proxy (Nginx, Caddy, Traefik…)
+      - TRUST_PROXY=0
