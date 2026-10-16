@@ -188,6 +188,7 @@ function renderDetail(full = true) {
           <div style="margin-top:6px">${/^https?:/.test(m.target) ? `<a class="tgt" href="${esc(m.target)}" target="_blank" rel="noopener">${esc(m.target)}</a>` : `<span class="tgt">${esc(m.target)}</span>`}
             <span class="muted small"> · ${esc(TYPE_LABEL[m.type])} · ${m.type === 'push' ? 'push attendu' : ''} toutes les ${m.config.interval} s</span></div>
           ${m.lastMsg ? `<div class="muted small" style="margin-top:4px">Dernier résultat : ${esc(m.lastMsg)}</div>` : ''}
+          ${depsHTML(m)}
         </div>
         <div class="actions">
           <button class="btn" id="d-toggle">${m.config.active ? '⏸ Pause' : '▶ Reprendre'}</button>
@@ -260,6 +261,15 @@ function renderDetail(full = true) {
   loadChart();
 }
 
+function depsHTML(m) {
+  const parent = m.config.parentId ? monitors.find((x) => x.id === m.config.parentId) : null;
+  const kids = monitors.filter((x) => x.config.parentId === m.id);
+  if (!parent && !kids.length) return '';
+  return `<div class="small" style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+    ${parent ? `<span class="muted">Dépend de</span> <a class="chip" href="#m-${parent.id}"><span class="dot s${parent.status}" style="width:8px;height:8px;animation:none"></span>${esc(parent.name)}</a>` : ''}
+    ${kids.length ? `<span class="muted">${parent ? ' · ' : ''}Services dépendants</span> ${kids.map((k) => `<a class="chip" href="#m-${k.id}"><span class="dot s${k.status}" style="width:8px;height:8px;animation:none"></span>${esc(k.name)}</a>`).join('')}` : ''}
+  </div>`;
+}
 function fmtUptime(sec) {
   const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600);
   return d ? `${d} j ${h} h` : `${h} h ${Math.floor((sec % 3600) / 60)} min`;
@@ -479,6 +489,7 @@ function openMonitorForm(cfg = {}) {
       </div>
       <div class="row">
         <div class="field"><label>Groupe (page publique)</label><input name="group" list="groups" value="${esc(c.group || '')}" placeholder="Services"><datalist id="groups">${groups.map((g) => `<option value="${esc(g)}">`).join('')}</datalist></div>
+        <div class="field"><label>Dépend de (alertes masquées si ce parent est en panne)</label><select name="parentId"><option value="">— Aucun —</option>${monitors.filter((x) => x.id !== c.id).map((x) => `<option value="${x.id}" ${c.parentId === x.id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select></div>
       </div>
       <div class="field"><label>Description (affichée publiquement)</label><input name="description" value="${esc(c.description || '')}"></div>
 
@@ -574,7 +585,7 @@ async function openIncidents() {
     <div class="panel-head"><h2 style="margin:0">Incidents & maintenances</h2><button class="btn primary" id="i-new">＋ Nouveau</button></div>
     <div id="i-list">${list.length ? list.map((i) => `<div class="list-item">
       <div style="min-width:0"><b>${esc(i.title)}</b>
-        <div class="small muted">${esc(SEV_LABEL[i.severity])} · ${esc(INC_STATUS[i.status])} · ${fmtDate(i.createdAt)}</div></div>
+        <div class="small muted">${esc(SEV_LABEL[i.severity])} · ${esc(INC_STATUS[i.status])}${i.recurrence ? ' · 🔁 récurrente' : ''} · ${fmtDate(i.createdAt)}</div></div>
       <div class="actions"><button class="btn sm" data-edit="${i.id}">Mettre à jour</button><button class="btn sm danger" data-del="${i.id}">✕</button></div>
     </div>`).join('') : '<p class="muted">Aucun incident. Publie un incident ou planifie une maintenance pour informer tes utilisateurs.</p>'}</div>
     <div class="modal-foot"><button class="btn" onclick="closeModal()">Fermer</button></div>`, true);
@@ -594,9 +605,18 @@ function incidentForm(i) {
         <div class="field"><label>Type</label><select name="severity">${Object.entries(SEV_LABEL).map(([k, v]) => `<option value="${k}" ${i.severity === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
         <div class="field"><label>Statut</label><select name="status">${Object.entries(INC_STATUS).map(([k, v]) => `<option value="${k}" ${i.status === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
       </div>
+      <label class="check t-maint"><input type="checkbox" id="i-rec" ${i.recurrence ? 'checked' : ''}> 🔁 Maintenance récurrente (ex. redémarrage quotidien du serveur)</label>
+      <fieldset class="t-maint t-rec"><legend>Récurrence</legend>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">${[1, 2, 3, 4, 5, 6, 0].map((d) => `<label class="chip" style="cursor:pointer"><input type="checkbox" data-day="${d}" ${!i.recurrence || i.recurrence.days.includes(d) ? 'checked' : ''}> ${['Dim', 'Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam'][d]}</label>`).join('')}</div>
+        <div class="row">
+          <div class="field"><label>De</label><input type="time" id="i-rs" value="${esc(i.recurrence ? i.recurrence.start : '04:00')}"></div>
+          <div class="field"><label>À</label><input type="time" id="i-re" value="${esc(i.recurrence ? i.recurrence.end : '04:15')}"></div>
+        </div>
+        <p class="muted small" style="margin-top:-6px">Heure du serveur. Un créneau peut passer minuit (ex. 23:30 → 00:30).</p>
+      </fieldset>
       <div class="row t-maint">
-        <div class="field"><label>Début de la maintenance</label><input type="datetime-local" name="startsAt" value="${toLocalInput(i.startsAt)}"></div>
-        <div class="field"><label>Fin prévue</label><input type="datetime-local" name="endsAt" value="${toLocalInput(i.endsAt)}"></div>
+        <div class="field"><label id="i-sl">Début de la maintenance</label><input type="datetime-local" name="startsAt" value="${toLocalInput(i.startsAt)}"></div>
+        <div class="field"><label id="i-el">Fin prévue</label><input type="datetime-local" name="endsAt" value="${toLocalInput(i.endsAt)}"></div>
       </div>
       <p class="muted small t-maint" style="margin-top:-6px">Pendant la fenêtre de maintenance, les monitors concernés passent en « Maintenance » et n’envoient pas d’alerte.</p>
       ${isEdit ? `<div class="field"><label>Nouveau message de suivi</label><textarea name="updateText" placeholder="Le correctif a été déployé, nous surveillons la situation…"></textarea></div>`
@@ -607,7 +627,15 @@ function incidentForm(i) {
       <div class="modal-foot"><button type="button" class="btn ghost" id="i-back">Retour</button><button class="btn primary" type="submit">${isEdit ? 'Publier la mise à jour' : 'Publier'}</button></div>
     </form>`);
   const form = $('#iform', el);
-  const sync = () => $$('.t-maint', form).forEach((x) => x.classList.toggle('hidden', form.severity.value !== 'maintenance'));
+  const sync = () => {
+    const maint = form.severity.value === 'maintenance';
+    const rec = $('#i-rec', el).checked;
+    $$('.t-maint', form).forEach((x) => x.classList.toggle('hidden', !maint));
+    $$('.t-rec', form).forEach((x) => x.classList.toggle('hidden', !maint || !rec));
+    $('#i-sl', el).textContent = rec ? 'Valable à partir du (optionnel)' : 'Début de la maintenance';
+    $('#i-el', el).textContent = rec ? 'Jusqu’au (optionnel)' : 'Fin prévue';
+  };
+  $('#i-rec', el).onchange = sync;
   form.severity.onchange = () => { sync(); if (form.severity.value === 'maintenance' && !isEdit) form.status.value = 'scheduled'; };
   sync();
   $('#i-back', el).onclick = openIncidents;
@@ -618,6 +646,9 @@ function incidentForm(i) {
     if (isEdit) d.content = i.content;
     d.startsAt = d.startsAt ? new Date(d.startsAt).toISOString() : null;
     d.endsAt = d.endsAt ? new Date(d.endsAt).toISOString() : null;
+    d.recurrence = d.severity === 'maintenance' && $('#i-rec', el).checked
+      ? { days: $$('[data-day]', form).filter((c) => c.checked).map((c) => Number(c.dataset.day)), start: $('#i-rs', el).value, end: $('#i-re', el).value }
+      : null;
     try {
       await api(isEdit ? '/api/incidents/' + i.id : '/api/incidents', { method: isEdit ? 'PUT' : 'POST', body: d });
       toast('Incident publié');
@@ -753,6 +784,10 @@ function pageForm(p) {
 // Paramètres
 async function openSettings() {
   const s = await api('/api/settings');
+  await loadNotifications();
+  const dl = s.discordLive, wr = s.weeklyReport;
+  const pageOpts = (sel) => `<option value="">Page principale (/)</option>${s.pages.map((p) => `<option value="${esc(p.slug)}" ${sel === p.slug ? 'selected' : ''}>${esc(p.title)} (/s/${esc(p.slug)})${p.protected ? ' 🔒' : ''}</option>`).join('')}`;
+  const DAYS = ['Dimanche', 'Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi'];
   const el = modal(`
     <h2>Paramètres</h2>
     <form id="sform">
@@ -761,7 +796,42 @@ async function openSettings() {
         <div class="field"><label>Description</label><input name="description" value="${esc(s.description)}"></div>
         <div class="field"><label>URL du logo</label><input name="logoUrl" value="${esc(s.logoUrl)}" placeholder="https://…/logo.png"></div>
         <div class="field"><label>Texte de pied de page</label><input name="footer" value="${esc(s.footer)}" placeholder="© Craftpick"></div>
+        <div class="field"><label>URL publique de la page de status (liens Discord, flux…)</label><input name="publicUrl" value="${esc(s.publicUrl)}" placeholder="https://status.craftpick.fr"></div>
       </fieldset>
+
+      <fieldset><legend>💬 Message Discord en direct</legend>
+        <p class="muted small" style="margin-top:0">Un message unique dans ton salon, modifié automatiquement à chaque changement d'état (et toutes les 2 min pour les joueurs). Salon → Paramètres → Intégrations → Webhooks.</p>
+        <label class="check"><input type="checkbox" id="dl-on" ${dl.enabled ? 'checked' : ''}> Activer</label>
+        <div class="field"><label>URL du webhook Discord</label><input id="dl-url" value="${esc(dl.webhookUrl)}" placeholder="https://discord.com/api/webhooks/…"></div>
+        <div class="row">
+          <div class="field"><label>Services affichés</label><select id="dl-page">${pageOpts(dl.page)}</select></div>
+          <div class="field"><label>Nom du bot</label><input id="dl-name" value="${esc(dl.username)}" placeholder="Craftpick Status"></div>
+        </div>
+        <div class="actions" style="margin-bottom:12px;align-items:center"><button type="button" class="btn sm" id="dl-pub">Publier maintenant</button>
+          <span class="small ${dl.lastError ? '' : 'muted'}" style="${dl.lastError ? 'color:var(--down)' : ''}">${dl.lastError ? '⚠ ' + esc(dl.lastError) : dl.messageId ? '✓ Message actif' : ''}</span></div>
+      </fieldset>
+
+      <fieldset><legend>📊 Rapport hebdomadaire</legend>
+        <label class="check"><input type="checkbox" id="wr-on" ${wr.enabled ? 'checked' : ''}> Envoyer automatiquement un rapport de disponibilité chaque semaine</label>
+        <div class="row">
+          <div class="field"><label>Jour</label><select id="wr-day">${[1, 2, 3, 4, 5, 6, 0].map((d) => `<option value="${d}" ${wr.day === d ? 'selected' : ''}>${DAYS[d]}</option>`).join('')}</select></div>
+          <div class="field"><label>Heure</label><select id="wr-hour">${Array.from({ length: 24 }, (_, h) => `<option value="${h}" ${wr.hour === h ? 'selected' : ''}>${String(h).padStart(2, '0')}:00</option>`).join('')}</select></div>
+        </div>
+        <div style="margin-bottom:10px">${notifications.length ? notifications.map((n) => `<label class="check"><input type="checkbox" data-wr="${n.id}" ${(wr.notificationIds || []).includes(n.id) ? 'checked' : ''}> 🔔 ${esc(n.name)} <span class="muted small">(${esc(n.type)})</span></label>`).join('') : '<p class="muted small">Ajoute d’abord une notification (menu « Notifications »).</p>'}</div>
+        <div class="actions" style="margin-bottom:12px"><button type="button" class="btn sm" id="wr-prev">Aperçu</button><button type="button" class="btn sm" id="wr-send">Envoyer maintenant</button></div>
+        <pre id="wr-out" class="small hidden" style="white-space:pre-wrap;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;margin:0 0 12px"></pre>
+      </fieldset>
+
+      <fieldset><legend>🧩 Widget à intégrer sur ton site</legend>
+        <div class="row">
+          <div class="field"><label>Services</label><select id="wg-page">${pageOpts('')}</select></div>
+          <div class="field"><label>Thème</label><select id="wg-theme"><option value="">Automatique</option><option value="light">Clair</option><option value="dark">Sombre</option></select></div>
+        </div>
+        <label class="check"><input type="checkbox" id="wg-up"> Afficher la disponibilité sur 30 jours</label>
+        <div class="field"><label>Code à coller dans ton site</label><textarea id="wg-code" readonly onclick="this.select()" style="min-height:64px"></textarea></div>
+        <iframe id="wg-prev" style="width:100%;max-width:420px;height:260px;border:0;border-radius:12px" title="Aperçu du widget"></iframe>
+      </fieldset>
+
       <fieldset><legend>Changer le mot de passe</legend>
         <div class="row">
           <div class="field"><label>Mot de passe actuel</label><input type="password" name="currentPassword" autocomplete="current-password"></div>
@@ -775,7 +845,48 @@ async function openSettings() {
         </div>
       </fieldset>
       <div class="modal-foot"><button type="button" class="btn ghost" onclick="closeModal()">Annuler</button><button class="btn primary" type="submit">Enregistrer</button></div>
-    </form>`);
+    </form>`, true);
+
+  // Widget : code + aperçu
+  const widget = () => {
+    const q = new URLSearchParams();
+    if ($('#wg-page', el).value) q.set('page', $('#wg-page', el).value);
+    if ($('#wg-theme', el).value) q.set('theme', $('#wg-theme', el).value);
+    if ($('#wg-up', el).checked) q.set('uptime', '1');
+    const base = (s.publicUrl || location.origin).replace(/\/+$/, '');
+    const src = `${base}/embed${q.toString() ? '?' + q : ''}`;
+    $('#wg-code', el).value = `<iframe src="${src}" style="width:100%;max-width:420px;height:320px;border:0" title="Statut des services" loading="lazy"></iframe>`;
+    $('#wg-prev', el).src = `/embed${q.toString() ? '?' + q : ''}`;
+  };
+  ['#wg-page', '#wg-theme', '#wg-up'].forEach((sel) => ($(sel, el).onchange = widget));
+  widget();
+
+  const collect = () => {
+    const d = formData($('#sform', el));
+    d.discordLive = { enabled: $('#dl-on', el).checked, webhookUrl: $('#dl-url', el).value.trim(), page: $('#dl-page', el).value, username: $('#dl-name', el).value };
+    d.weeklyReport = { enabled: $('#wr-on', el).checked, day: Number($('#wr-day', el).value), hour: Number($('#wr-hour', el).value), notificationIds: $$('[data-wr]', el).filter((c) => c.checked).map((c) => Number(c.dataset.wr)) };
+    return d;
+  };
+  $('#dl-pub', el).onclick = async () => {
+    try {
+      await api('/api/settings', { method: 'PUT', body: collect() });
+      const r = await api('/api/discord-live/publish', { method: 'POST' });
+      r.ok ? toast(r.created ? 'Message Discord publié ✓' : 'Message Discord mis à jour ✓') : toast('Discord : ' + r.error, true);
+    } catch (err) { toast(err.message, true); }
+  };
+  $('#wr-prev', el).onclick = async () => {
+    const r = await api('/api/report/preview');
+    const out = $('#wr-out', el);
+    out.textContent = `${r.title}\n\n${r.text.replace(/\*\*/g, '')}`;
+    out.classList.remove('hidden');
+  };
+  $('#wr-send', el).onclick = async () => {
+    try {
+      await api('/api/settings', { method: 'PUT', body: collect() });
+      const r = await api('/api/report/send', { method: 'POST' });
+      r.errors.length ? toast('Erreurs : ' + r.errors.join(' ; '), true) : toast(`Rapport envoyé (${r.sent}) ✓`);
+    } catch (err) { toast(err.message, true); }
+  };
   $('#imp', el).onchange = async (e) => {
     const f = e.target.files[0]; if (!f) return;
     try { const r = await api('/api/import', { method: 'POST', body: JSON.parse(await f.text()) }); toast(`${r.imported} monitor(s) importé(s)`); await Promise.all([loadMonitors(), loadNotifications()]); }
@@ -784,7 +895,7 @@ async function openSettings() {
   $('#sform', el).onsubmit = async (e) => {
     e.preventDefault();
     try {
-      const d = formData(e.target);
+      const d = collect();
       await api('/api/settings', { method: 'PUT', body: d });
       $('#app-title').textContent = d.title;
       toast('Paramètres enregistrés'); closeModal();

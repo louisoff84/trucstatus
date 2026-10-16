@@ -12,6 +12,7 @@ const http = require('node:http');
 const { checkMinecraft, writeVarInt, readVarInt, packet, mcString, MAGIC } = require('../lib/minecraft');
 const { checkProxmox } = require('../lib/proxmox');
 const { applyDegraded } = require('../lib/monitor');
+const { inRecurringWindow, maintenanceActive, describeRecurrence } = require('../lib/schedule');
 
 const servers = [];
 let proc, base, cookie = '';
@@ -85,7 +86,7 @@ async function call(method, url, body, jar = true) {
 before(async () => {
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
-  proc = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], { env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', DATA_DIR: dataDir }, stdio: 'pipe' });
+  proc = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], { env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', DATA_DIR: dataDir, ALLOW_ANY_WEBHOOK: '1' }, stdio: 'pipe' });
   for (let i = 0; i < 50; i++) {
     try { await fetch(base + '/api/health'); break; } catch { await new Promise((r) => setTimeout(r, 100)); }
   }
@@ -207,4 +208,99 @@ test('pages de status : sélection, protection par mot de passe', async () => {
   // la route HTML /s/<slug> sert la page de status
   assert.strictEqual((await fetch(base + '/s/infra')).status, 200);
   assert.strictEqual((await call('GET', '/api/status?page=inconnue', undefined, false)).status, 404);
+});
+
+// ───────── v1.3 ─────────
+const hhmm = (d) => String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+test('maintenance récurrente : créneaux, passage de minuit, description', () => {
+  const at = (day, h, m) => { const d = new Date(2026, 9, 11 + day, h, m); return d; }; // 11/10/2026 = dimanche
+  const nightly = { days: [0, 1, 2, 3, 4, 5, 6], start: '04:00', end: '04:15' };
+  assert.ok(inRecurringWindow(nightly, at(1, 4, 5)));
+  assert.ok(!inRecurringWindow(nightly, at(1, 4, 15)));
+  const lateMon = { days: [1], start: '23:30', end: '00:30' };
+  assert.ok(inRecurringWindow(lateMon, at(1, 23, 45)));   // lundi soir
+  assert.ok(inRecurringWindow(lateMon, at(2, 0, 10)));    // mardi 00:10, suite du lundi
+  assert.ok(!inRecurringWindow(lateMon, at(3, 0, 10)));   // mercredi : non
+  assert.strictEqual(describeRecurrence(nightly), 'tous les jours, 04:00 – 04:15');
+  assert.ok(!maintenanceActive({ severity: 'maintenance', status: 'scheduled', recurrence: nightly, endsAt: '2020-01-01' }, at(1, 4, 5).getTime()));
+});
+
+test('maintenance récurrente : le monitor passe en maintenance', async () => {
+  const now = new Date();
+  const start = new Date(now.getTime() - 60000), end = new Date(now.getTime() + 10 * 60000);
+  const m = (await call('POST', '/api/monitors', { name: 'Redémarrage', type: 'push', interval: 60 })).body;
+  assert.strictEqual((await call('POST', '/api/incidents', { title: 'x', severity: 'maintenance', status: 'scheduled', recurrence: { days: [], start: '04:00', end: '05:00' } })).status, 400);
+  const inc = (await call('POST', '/api/incidents', { title: 'Redémarrage quotidien', severity: 'maintenance', status: 'scheduled', monitorIds: [m.id], recurrence: { days: [0, 1, 2, 3, 4, 5, 6], start: hhmm(start), end: hhmm(end) } })).body;
+  await call('GET', m.pushPath);
+  const mm = (await call('GET', '/api/monitors')).body.find((x) => x.id === m.id);
+  assert.strictEqual(mm.status, 3);
+  const pub = (await call('GET', '/api/status', undefined, false)).body.incidents.find((i) => i.id === inc.id);
+  assert.strictEqual(pub.activeNow, true);
+  assert.match(pub.recurrenceText, /tous les jours/);
+  await call('DELETE', '/api/incidents/' + inc.id);
+});
+
+test('dépendances : alerte masquée si le parent est en panne, pas de boucle', async () => {
+  const parent = (await call('POST', '/api/monitors', { name: 'Nœud', type: 'push', interval: 60 })).body;
+  const child = (await call('POST', '/api/monitors', { name: 'VM', type: 'push', interval: 60, parentId: parent.id })).body;
+  assert.strictEqual(child.config.parentId, parent.id);
+  // boucle interdite
+  const r = await call('PUT', '/api/monitors/' + parent.id, { ...parent.config, parentId: child.id });
+  assert.strictEqual(r.status, 400);
+  await call('GET', parent.pushPath); await call('GET', child.pushPath);
+  await call('GET', parent.pushPath + '?status=down');
+  await call('GET', child.pushPath + '?status=down');
+  await sleep(150);
+  const beats = (await call('GET', `/api/monitors/${child.id}/beats?hours=1`)).body;
+  assert.match(beats[beats.length - 1].m, /alerte masquée.*Nœud/);
+});
+
+test('message Discord en direct : création puis modification du même message', async () => {
+  const hits = [];
+  const srv = http.createServer((req, res) => {
+    let b = ''; req.on('data', (c) => (b += c)); req.on('end', () => {
+      hits.push({ method: req.method, url: req.url, body: JSON.parse(b || '{}') });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(req.method === 'POST' ? { id: '987654321' } : {}));
+    });
+  });
+  servers.push(srv);
+  const port = await listen(srv);
+  const url = `http://127.0.0.1:${port}/api/webhooks/1/abc`;
+  assert.strictEqual((await call('PUT', '/api/settings', { title: 'Craftpick Status', discordLive: { enabled: false, webhookUrl: url, page: '' } })).status, 200);
+  const r1 = (await call('POST', '/api/discord-live/publish', {})).body;
+  assert.strictEqual(r1.ok, true); assert.strictEqual(r1.created, true);
+  const r2 = (await call('POST', '/api/discord-live/publish', {})).body;
+  assert.strictEqual(r2.ok, true); assert.ok(!r2.created);
+  assert.strictEqual(hits[0].method, 'POST'); assert.match(hits[0].url, /wait=true/);
+  assert.strictEqual(hits[1].method, 'PATCH'); assert.match(hits[1].url, /\/messages\/987654321$/);
+  assert.ok(hits[1].body.embeds[0].fields.length > 0);
+});
+
+test('rapport hebdomadaire : aperçu et envoi', async () => {
+  const got = [];
+  const srv = http.createServer((req, res) => { let b = ''; req.on('data', (c) => (b += c)); req.on('end', () => { got.push(JSON.parse(b)); res.end('{}'); }); });
+  servers.push(srv);
+  const port = await listen(srv);
+  const n = (await call('POST', '/api/notifications', { name: 'Hook', type: 'webhook', config: { url: `http://127.0.0.1:${port}/` } })).body;
+  const prev = (await call('GET', '/api/report/preview')).body;
+  assert.match(prev.text, /Disponibilité moyenne/);
+  assert.match(prev.text, /Nœud — /);
+  assert.ok(prev.monitors.find((x) => x.name === 'Nœud').outages >= 1);
+  assert.strictEqual((await call('POST', '/api/report/send', {})).status, 400);
+  await call('PUT', '/api/settings', { title: 'Craftpick Status', weeklyReport: { enabled: true, day: 1, hour: 9, notificationIds: [n.id] } });
+  const r = (await call('POST', '/api/report/send', {})).body;
+  assert.strictEqual(r.sent, 1);
+  assert.strictEqual(got[0].type, 'report');
+  assert.match(got[0].title, /Rapport hebdomadaire/);
+});
+
+test('widget : /embed intégrable en iframe, le reste non', async () => {
+  const e = await fetch(base + '/embed?theme=dark');
+  assert.strictEqual(e.status, 200);
+  assert.strictEqual(e.headers.get('x-frame-options'), null);
+  const h = await fetch(base + '/');
+  assert.strictEqual(h.headers.get('x-frame-options'), 'SAMEORIGIN');
 });

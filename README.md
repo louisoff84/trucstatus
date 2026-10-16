@@ -44,6 +44,7 @@ Les données sont stockées dans `./data`, monté comme volume.
 - Tentatives avant alerte, intervalle accéléré en cas de panne, **rappels réguliers tant que le service reste en panne**
 - Durée de la panne indiquée au retour du service (« de retour après 12 min »)
 - Suivi de l'expiration des certificats TLS, avec alerte
+- **Dépendances** : un monitor peut dépendre d'un parent (ex. une VM → le nœud Proxmox). Si le parent est en panne, les alertes des enfants sont masquées
 
 **Page publique**
 - Bandeau d'état global, groupes de services, barres de disponibilité sur 90 jours
@@ -55,7 +56,10 @@ Les données sont stockées dans `./data`, monté comme volume.
 **Administration**
 - Tableau de bord, recherche, graphique des temps de réponse (1 h → 7 j), journal des changements d'état
 - Pause, duplication, test d'un monitor avant de l'enregistrer
-- Maintenances planifiées : les monitors concernés passent en « Maintenance », sans alerte
+- Maintenances planifiées, ponctuelles ou **récurrentes** (ex. redémarrage chaque nuit de 04:00 à 04:15) : les monitors concernés passent en « Maintenance », sans alerte
+- **Message Discord en direct** : un message unique dans ton salon, modifié automatiquement (état, joueurs, incidents)
+- **Rapport hebdomadaire** de disponibilité (uptime, pannes, durée, ping, pic de joueurs) envoyé sur tes notifications
+- **Widget** à intégrer sur ton site (`/embed`, iframe)
 - Notifications : Discord, Slack, Telegram, ntfy, Gotify, Pushover, webhook JSON (avec envoi de test)
 - Alertes du navigateur quand un service change d'état
 - Sessions conservées après un redémarrage, export / import de la configuration
@@ -106,6 +110,33 @@ Menu **Pages** de l'admin : crée par exemple `/s/joueurs` (serveurs de jeu, sit
 
 La page principale `/` continue d'afficher les monitors marqués « publics ». Un monitor privé peut apparaître sur une page dédiée protégée.
 
+## Message Discord en direct
+
+*Paramètres → Message Discord en direct* :
+1. Colle l'URL d'un webhook (salon Discord → Paramètres → Intégrations → Webhooks).
+2. Choisis la page à afficher.
+3. Active l'option.
+
+Le bot publie un message, puis le **modifie** à chaque changement d'état, et toutes les 2 minutes pour les joueurs. Il n'envoie pas de nouveau message à chaque fois. Si le message est supprimé, il en recrée un.
+
+## Widget
+
+```html
+<iframe src="https://status.craftpick.fr/embed?page=joueurs&theme=dark" style="width:100%;max-width:420px;height:320px;border:0" loading="lazy"></iframe>
+```
+
+Paramètres :
+- `page=<slug>` : page à afficher.
+- `theme=light|dark` : thème.
+- `title=0` : masque l'en-tête.
+- `uptime=1` : affiche la disponibilité sur 30 jours.
+
+Le générateur de code se trouve dans *Paramètres*. Les pages protégées par mot de passe ne sont pas affichables en widget.
+
+## Rapport hebdomadaire
+
+*Paramètres → Rapport hebdomadaire* : choisis le jour, l'heure (heure du serveur) et les notifications de destination. Les boutons « Aperçu » et « Envoyer maintenant » permettent de tester.
+
 ## API publique
 
 | Route | Description |
@@ -114,6 +145,7 @@ La page principale `/` continue d'afficher les monitors marqués « publics ». 
 | `GET /api/health` | Santé du serveur (Docker, autre outil de monitoring) |
 | `GET /api/feed.xml` | Flux RSS des incidents |
 | `GET /api/badge/<id>` | Badge SVG |
+| `GET /embed` | Widget HTML intégrable |
 | `GET/POST /api/push/<token>` | Réception d'un heartbeat |
 
 ## Données

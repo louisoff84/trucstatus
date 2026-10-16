@@ -9,12 +9,14 @@ function incidentHTML(i) {
   const resolved = i.status === 'resolved';
   const ups = (i.updates || []).slice().reverse();
   let win = '';
-  if (i.severity === 'maintenance' && (i.startsAt || i.endsAt)) {
+  if (i.recurrence) {
+    win = `<div class="when" style="margin-top:4px">🔁 ${esc(i.recurrenceText)}</div>`;
+  } else if (i.severity === 'maintenance' && (i.startsAt || i.endsAt)) {
     win = `<div class="when" style="margin-top:4px">🗓️ ${i.startsAt ? fmtDate(i.startsAt) : '…'} → ${i.endsAt ? fmtDate(i.endsAt) : '…'}</div>`;
   }
   const affected = (i.monitorIds || []).map((id) => state.monitors.find((m) => m.id === id)).filter(Boolean).map((m) => esc(m.name));
   return `<div class="card incident ${resolved ? 'resolved' : esc(i.severity)}">
-    <h3>${esc(i.title)} <span class="pill ${resolved ? 's1' : i.severity === 'maintenance' ? 's3' : i.severity === 'danger' ? 's0' : 's2'}">${esc(INC_STATUS[i.status] || i.status)}</span></h3>
+    <h3>${esc(i.title)} <span class="pill ${resolved ? 's1' : i.severity === 'maintenance' ? 's3' : i.severity === 'danger' ? 's0' : 's2'}">${esc(i.severity === 'maintenance' && !resolved ? (i.activeNow ? 'En cours' : 'Planifiée') : INC_STATUS[i.status] || i.status)}</span></h3>
     ${win}
     ${affected.length ? `<div class="when" style="margin-top:4px">Services concernés : ${affected.join(', ')}</div>` : ''}
     ${ups.map((u) => `<div class="upd"><b>${esc(INC_STATUS[u.status] || u.status)}</b> — <span class="when">${fmtDate(u.at)}</span><p>${esc(u.text)}</p></div>`).join('')}
@@ -72,8 +74,11 @@ function render() {
     $('#overall').innerHTML = `<div class="ic">${ic}</div><div>${txt}<small>${ms.length} service${ms.length > 1 ? 's' : ''} surveillé${ms.length > 1 ? 's' : ''}</small></div>`;
   }
 
-  const active = s.incidents.filter((i) => i.status !== 'resolved');
-  $('#incidents').innerHTML = active.length ? `<div class="section-title">Incidents & maintenances en cours</div>` + active.map(incidentHTML).join('') : '';
+  const open = s.incidents.filter((i) => i.status !== 'resolved');
+  const active = open.filter((i) => i.severity !== 'maintenance' || i.activeNow);
+  const planned = open.filter((i) => i.severity === 'maintenance' && !i.activeNow);
+  $('#incidents').innerHTML = (active.length ? `<div class="section-title">Incidents & maintenances en cours</div>` + active.map(incidentHTML).join('') : '')
+    + (planned.length ? `<div class="section-title">Maintenances planifiées</div>` + planned.map(incidentHTML).join('') : '');
 
   const groups = {};
   for (const m of s.monitors) (groups[m.group || 'Services'] ||= []).push(m);

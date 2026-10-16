@@ -208,3 +208,5 @@ legend { font-size: 13px; font-weight: 600; padding: 0 6px; }
 .guests { display: flex; flex-wrap: wrap; gap: 6px; }
 .lock { max-width: 380px; margin: 40px auto; padding: 28px; text-align: center; }
 .lock h2 { font-size: 20px; margin-bottom: 6px; }
+a.chip { text-decoration: none; }
+a.chip:hover { border-color: var(--muted); }

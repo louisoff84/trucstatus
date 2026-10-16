@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Status</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    html, body { background: transparent; }
+    body { padding: 0; font-size: 14px; }
+    .w { border: 1px solid var(--border); border-radius: 12px; background: var(--card); overflow: hidden; }
+    .w-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px; font-weight: 600; border-bottom: 1px solid var(--border); }
+    .w-head .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .w-sum { padding: 10px 14px; font-weight: 600; display: flex; gap: 8px; align-items: center; }
+    .w-sum.s0 { color: var(--down); } .w-sum.s4 { color: var(--degraded); } .w-sum.s3 { color: var(--maint); } .w-sum.s1 { color: var(--up); }
+    .w-row { display: flex; align-items: center; gap: 9px; padding: 9px 14px; border-top: 1px solid var(--border); }
+    .w-row .n { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .w-foot { padding: 8px 14px; border-top: 1px solid var(--border); font-size: 12px; text-align: right; }
+    .w-foot a { color: var(--muted); text-decoration: none; }
+    .w-foot a:hover { color: var(--text); }
+  </style>
+</head>
+<body>
+  <div class="w" id="w"><div class="w-sum muted">Chargement…</div></div>
+  <script src="/common.js"></script>
+  <script>
+    // Paramètres : ?page=<slug>&theme=light|dark&title=0&uptime=1
+    const P = new URLSearchParams(location.search);
+    const PAGE = P.get('page');
+    if (P.get('theme') === 'light' || P.get('theme') === 'dark') document.documentElement.setAttribute('data-theme', P.get('theme'));
+    const showTitle = P.get('title') !== '0';
+    const showUptime = P.get('uptime') === '1';
+    const link = PAGE ? '/s/' + encodeURIComponent(PAGE) : '/';
+    let st = null;
+
+    function render() {
+      const ms = st.monitors;
+      const down = ms.filter((m) => m.status === 0).length, deg = ms.filter((m) => m.status === 4).length, maint = ms.filter((m) => m.status === 3).length;
+      const [cls, txt] = down ? ['s0', `${down} service${down > 1 ? 's' : ''} hors ligne`] : deg ? ['s4', 'Performances dégradées'] : maint ? ['s3', 'Maintenance en cours'] : ['s1', 'Tous les systèmes sont opérationnels'];
+      $('#w').innerHTML = `
+        ${showTitle ? `<div class="w-head">${st.logoUrl ? `<img src="${esc(st.logoUrl)}" alt="" style="height:22px;border-radius:4px">` : ''}<span class="t">${esc(st.title)}</span></div>` : ''}
+        <div class="w-sum ${cls}"><span class="dot ${cls}"></span>${txt}</div>
+        ${ms.map((m) => `<div class="w-row">
+          <span class="dot s${m.status}"></span><span class="n">${esc(m.name)}</span>
+          ${m.mc ? `<span class="chip">👥 ${m.mc.online}/${m.mc.max}</span>` : ''}
+          ${showUptime ? `<span class="muted small">${fmtPct(m.uptime30, 1)}</span>` : ''}
+          <span class="pill s${m.status}">${STATUS_LABEL[m.status]}</span>
+        </div>`).join('')}
+        <div class="w-foot"><a href="${link}" target="_blank" rel="noopener">Voir la page de status ↗</a></div>`;
+    }
+    async function load() {
+      try { st = await api('/api/status' + (PAGE ? '?page=' + encodeURIComponent(PAGE) : '')); render(); }
+      catch (e) {
+        $('#w').innerHTML = `<div class="w-sum muted">${e.status === 401 ? '🔒 Page protégée — widget indisponible' : e.status === 404 ? 'Page introuvable' : 'Status indisponible'}</div>`;
+      }
+    }
+    let t;
+    liveEvents(({ monitorId, beat }) => {
+      if (!st) return;
+      const m = st.monitors.find((x) => x.id === monitorId);
+      if (m && (beat.s !== m.status || beat.pl != null)) { clearTimeout(t); t = setTimeout(load, 800); }
+    }, load, PAGE);
+    setInterval(load, 120000);
+    load();
+  </script>
+</body>
+</html>

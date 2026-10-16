@@ -6,6 +6,9 @@ const crypto = require('crypto');
 const db = require('./lib/db');
 const monitor = require('./lib/monitor');
 const notify = require('./lib/notify');
+const schedule = require('./lib/schedule');
+const discordLive = require('./lib/discordLive');
+const report = require('./lib/report');
 
 const PORT = Number(process.env.PORT) || 3001;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -134,6 +137,8 @@ function sanitizeMonitor(b, existing = {}) {
     basicAuthPass: str(b.basicAuthPass, 200),
     pushToken: existing.pushToken
       || (/^[A-Za-z0-9]{16,64}$/.test(b.pushToken || '') && !db.data.monitors.some((x) => x.pushToken === b.pushToken) ? b.pushToken : crypto.randomBytes(16).toString('hex')),
+    // Dépendance : monitor parent (ex. nœud Proxmox pour une VM)
+    parentId: b.parentId ? Number(b.parentId) : null,
     // Statut dégradé
     degradedMs: clamp(b.degradedMs, 0, 300000, 0),
     notifyDegraded: !!b.notifyDegraded,
@@ -150,6 +155,18 @@ function sanitizeMonitor(b, existing = {}) {
   };
   if (['http', 'keyword', 'json', 'proxmox'].includes(m.type) && !/^https?:\/\//i.test(m.url)) throw new Error("L'URL doit commencer par http:// ou https://");
   if (['tcp', 'ping', 'dns', 'minecraft'].includes(m.type) && !m.hostname) throw new Error('Nom d’hôte requis');
+  if (m.parentId) {
+    if (!db.data.monitors.some((x) => x.id === m.parentId)) m.parentId = null;
+    else {
+      // pas de boucle : on remonte la chaîne des parents
+      let cur = m.parentId, guard = 0;
+      while (cur && guard++ < 20) {
+        if (existing.id && cur === existing.id) throw new Error('Dépendance circulaire : ce monitor ne peut pas dépendre de lui-même (directement ou non)');
+        const pm = db.data.monitors.find((x) => x.id === cur);
+        cur = pm ? pm.parentId : null;
+      }
+    }
+  }
   if (m.type === 'proxmox' && (!m.pveNode || !m.pveTokenId || !m.pveTokenSecret)) throw new Error('Nœud, ID du jeton et secret Proxmox requis');
   if (m.type === 'proxmox' && !/^[^@\s]+@[^!\s]+![^\s=]+$/.test(m.pveTokenId)) throw new Error('ID du jeton au format utilisateur@realm!nom (ex. root@pam!status)');
   if (m.type === 'tcp' && !m.port) throw new Error('Port requis');
@@ -296,7 +313,12 @@ function sanitizePage(b, existing = {}) {
 }
 const adminPage = (p) => ({ id: p.id, slug: p.slug, title: p.title, description: p.description, logoUrl: p.logoUrl, footer: p.footer, monitorIds: p.monitorIds, protected: !!p.passwordHash });
 function publicIncident(i) {
-  return { id: i.id, title: i.title, content: i.content, severity: i.severity, status: i.status, createdAt: i.createdAt, updatedAt: i.updatedAt, resolvedAt: i.resolvedAt, startsAt: i.startsAt, endsAt: i.endsAt, monitorIds: i.monitorIds, updates: i.updates || [] };
+  return {
+    id: i.id, title: i.title, content: i.content, severity: i.severity, status: i.status, createdAt: i.createdAt, updatedAt: i.updatedAt, resolvedAt: i.resolvedAt,
+    startsAt: i.startsAt, endsAt: i.endsAt, monitorIds: i.monitorIds, updates: i.updates || [],
+    recurrence: i.recurrence || null, recurrenceText: schedule.describeRecurrence(i.recurrence),
+    activeNow: i.severity === 'maintenance' ? schedule.maintenanceActive(i) : i.status !== 'resolved',
+  };
 }
 
 // ───────────────────────── SSE ─────────────────────────
@@ -329,10 +351,8 @@ const route = (method, pattern, handler, auth = false) => {
 };
 
 // Public
-route('GET', '/api/status', (req, res, p, q) => {
-  const r = resolvePage(req, res, q);
-  if (!r) return;
-  const { page } = r;
+// État d'une page (null = page principale) : utilisé par l'API publique et le message Discord
+function buildStatus(page) {
   const s = db.data.settings;
   const ids = visibleMonitorIds(page);
   const monitors = page
@@ -345,7 +365,13 @@ route('GET', '/api/status', (req, res, p, q) => {
   const meta = page
     ? { title: page.title, description: page.description, logoUrl: page.logoUrl || s.logoUrl || '', footer: page.footer || s.footer || '', page: page.slug }
     : { title: s.title, description: s.description, logoUrl: s.logoUrl || '', footer: s.footer || '' };
-  send(res, 200, { ...meta, monitors, incidents, setup: !s.adminHash });
+  const base = (s.publicUrl || '').replace(/\/+$/, '');
+  return { ...meta, monitors, incidents, setup: !s.adminHash, url: base ? base + (page ? '/s/' + page.slug : '/') : '' };
+}
+route('GET', '/api/status', (req, res, p, q) => {
+  const r = resolvePage(req, res, q);
+  if (!r) return;
+  send(res, 200, buildStatus(r.page));
 });
 route('GET', '/api/incidents/history', (req, res, p, q) => {
   const r = resolvePage(req, res, q);
@@ -493,6 +519,7 @@ route('DELETE', '/api/monitors/:id', (req, res, p) => {
   db.data.monitors = db.data.monitors.filter((x) => x.id !== id);
   monitor.forget(id);
   db.data.pages.forEach((pg) => { pg.monitorIds = (pg.monitorIds || []).filter((x) => x !== id); });
+  db.data.monitors.forEach((x) => { if (x.parentId === id) x.parentId = null; });
   db.removeMonitorData(id);
   send(res, 200, { ok: true });
 }, true);
@@ -526,6 +553,7 @@ function sanitizeIncident(b, existing = {}) {
     monitorIds: Array.isArray(b.monitorIds) ? b.monitorIds.map(Number).filter(Number.isFinite) : [],
     startsAt: b.startsAt ? new Date(b.startsAt).toISOString() : null,
     endsAt: b.endsAt ? new Date(b.endsAt).toISOString() : null,
+    recurrence: b.severity === 'maintenance' && b.recurrence ? schedule.sanitizeRecurrence(b.recurrence) : null,
     updatedAt: new Date().toISOString(),
   };
   if (i.status === 'resolved' && !i.resolvedAt) i.resolvedAt = new Date().toISOString();
@@ -620,8 +648,13 @@ route('DELETE', '/api/pages/:id', (req, res, prm) => {
 
 // Paramètres (admin)
 route('GET', '/api/settings', (req, res) => {
-  const { title, description, logoUrl, footer } = db.data.settings;
-  send(res, 200, { title, description, logoUrl: logoUrl || '', footer: footer || '' });
+  const { title, description, logoUrl, footer, publicUrl, discordLive: dl, weeklyReport: wr } = db.data.settings;
+  send(res, 200, {
+    title, description, logoUrl: logoUrl || '', footer: footer || '', publicUrl: publicUrl || '',
+    discordLive: { enabled: false, webhookUrl: '', page: '', username: '', ...(dl || {}) },
+    weeklyReport: { enabled: false, day: 1, hour: 9, notificationIds: [], ...(wr || {}) },
+    pages: db.data.pages.map((pg) => ({ slug: pg.slug, title: pg.title, protected: !!pg.passwordHash })),
+  });
 }, true);
 route('PUT', '/api/settings', async (req, res) => {
   const b = await readBody(req);
@@ -630,6 +663,32 @@ route('PUT', '/api/settings', async (req, res) => {
   s.description = str(b.description, 500);
   s.logoUrl = str(b.logoUrl, 1000);
   s.footer = str(b.footer, 500);
+  if (b.publicUrl !== undefined) {
+    s.publicUrl = str(b.publicUrl, 300).replace(/\/+$/, '');
+    if (s.publicUrl && !/^https?:\/\//.test(s.publicUrl)) return send(res, 400, { error: "L'URL publique doit commencer par http:// ou https://" });
+  }
+  if (b.discordLive) {
+    const d = b.discordLive, prev = s.discordLive || {};
+    const url = str(d.webhookUrl, 500).trim();
+    if (d.enabled && !/^https:\/\/(?:\w+\.)?discord(?:app)?\.com\/api\/webhooks\//.test(url) && !process.env.ALLOW_ANY_WEBHOOK) return send(res, 400, { error: 'URL de webhook Discord invalide (https://discord.com/api/webhooks/…)' });
+    const page = str(d.page, 40);
+    if (page && !findPage(page)) return send(res, 400, { error: 'Page inconnue' });
+    s.discordLive = {
+      enabled: !!d.enabled, webhookUrl: url, page, username: str(d.username, 80),
+      // nouveau webhook ou nouvelle page : on repart sur un nouveau message
+      messageId: url === prev.webhookUrl && page === (prev.page || '') ? prev.messageId || null : null,
+      lastError: prev.lastError || null,
+    };
+    discordLive.schedule(1000);
+  }
+  if (b.weeklyReport) {
+    const w = b.weeklyReport;
+    s.weeklyReport = {
+      ...(s.weeklyReport || {}),
+      enabled: !!w.enabled, day: clamp(w.day, 0, 6, 1), hour: clamp(w.hour, 0, 23, 9),
+      notificationIds: Array.isArray(w.notificationIds) ? w.notificationIds.map(Number).filter(Number.isFinite) : [],
+    };
+  }
   if (b.newPassword) {
     if (!checkPassword(String(b.currentPassword || ''))) return send(res, 400, { error: 'Mot de passe actuel incorrect' });
     if (String(b.newPassword).length < 8) return send(res, 400, { error: 'Nouveau mot de passe : 8 caractères minimum' });
@@ -640,6 +699,39 @@ route('PUT', '/api/settings', async (req, res) => {
   db.save(); broadcastRefresh();
   send(res, 200, { ok: true });
 }, true);
+// Message Discord en direct : publication immédiate
+route('POST', '/api/discord-live/publish', async (req, res) => {
+  try { send(res, 200, await discordLive.publish()); }
+  catch (e) { db.data.settings.discordLive && (db.data.settings.discordLive.lastError = e.message); send(res, 200, { ok: false, error: e.message }); }
+}, true);
+
+// Rapport hebdomadaire
+function sendWeeklyReport() {
+  const wr = db.data.settings.weeklyReport || {};
+  const r = report.buildReport({ title: db.data.settings.title });
+  const targets = db.data.notifications.filter((n) => n.active !== false && (wr.notificationIds || []).includes(n.id));
+  return Promise.allSettled(targets.map((n) => notify.sendText(n, r))).then((res) => ({
+    sent: res.filter((x) => x.status === 'fulfilled').length,
+    errors: res.map((x, i) => (x.status === 'rejected' ? `${targets[i].name} : ${x.reason.message}` : null)).filter(Boolean),
+  }));
+}
+route('GET', '/api/report/preview', (req, res) => send(res, 200, report.buildReport({ title: db.data.settings.title })), true);
+route('POST', '/api/report/send', async (req, res) => {
+  const wr = db.data.settings.weeklyReport || {};
+  if (!(wr.notificationIds || []).length) return send(res, 400, { error: 'Choisis au moins une notification pour le rapport, puis enregistre' });
+  send(res, 200, await sendWeeklyReport());
+}, true);
+// Planificateur : vérifie toutes les 5 min si c'est le moment d'envoyer le rapport
+setInterval(() => {
+  const wr = db.data.settings.weeklyReport;
+  if (!wr || !wr.enabled) return;
+  const now = new Date();
+  if (now.getDay() !== wr.day || now.getHours() !== wr.hour) return;
+  if (wr.lastSent && Date.now() - wr.lastSent < 6 * 86400000) return;
+  wr.lastSent = Date.now(); db.save();
+  sendWeeklyReport().then((r) => console.log(`[rapport] envoyé (${r.sent})`, r.errors.join(' ; ')));
+}, 5 * 60000).unref();
+
 route('GET', '/api/export', (req, res) => {
   const { monitors, incidents, notifications, pages } = db.data;
   res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Disposition': 'attachment; filename="craftpick-status-backup.json"' });
@@ -654,13 +746,16 @@ route('POST', '/api/import', async (req, res) => {
   const monIdMap = {};
   for (const raw of b.monitors) {
     try {
-      const m = sanitizeMonitor({ ...raw, notificationIds: (raw.notificationIds || []).map((x) => idMap[x]).filter(Boolean) });
+      const m = sanitizeMonitor({ ...raw, parentId: null, notificationIds: (raw.notificationIds || []).map((x) => idMap[x]).filter(Boolean) });
+      if (raw.parentId) m._importParent = raw.parentId;
       m.id = db.nextId(); m.createdAt = new Date().toISOString();
       monIdMap[raw.id] = m.id;
       db.data.monitors.push(m); monitor.start(m); count++;
     } catch {}
   }
   db.save();
+  // Dépendances : on relie aux nouveaux identifiants
+  for (const m of db.data.monitors) if (m._importParent) { m.parentId = monIdMap[m._importParent] || null; delete m._importParent; }
   // Pages : on recrée celles dont l'adresse est libre, en conservant leur mot de passe
   for (const raw of b.pages || []) {
     try {
@@ -681,6 +776,7 @@ function serveStatic(req, res, pathname) {
   if (pathname === '/') pathname = '/status.html';
   else if (pathname === '/admin' || pathname === '/admin/') pathname = '/admin.html';
   else if (pathname === '/history') pathname = '/history.html';
+  else if (pathname === '/embed' || pathname === '/embed/') pathname = '/embed.html';
   else if (/^\/s\/[a-z0-9-]+\/?$/i.test(pathname)) pathname = '/status.html';
   else if (/^\/s\/[a-z0-9-]+\/history\/?$/i.test(pathname)) pathname = '/history.html';
   const file = path.normalize(path.join(PUBLIC_DIR, pathname));
@@ -694,7 +790,7 @@ function serveStatic(req, res, pathname) {
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  if (!/^\/embed\/?$/.test(req.url.split('?')[0])) res.setHeader('X-Frame-Options', 'SAMEORIGIN');
   const url = new URL(req.url, 'http://x');
   if (url.pathname.startsWith('/api/')) {
     for (const r of routes) {
@@ -717,7 +813,13 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(405); res.end();
 });
 
+monitor.setStatusChangeHandler(() => discordLive.schedule());
 monitor.startAll(broadcast);
+discordLive.start((slug) => {
+  const page = slug ? findPage(slug) : null;
+  if (slug && !page) return null;
+  return buildStatus(page);
+});
 server.listen(PORT, HOST, () => {
   console.log(`\n  Craftpick Status démarré`);
   console.log(`  Page publique : http://localhost:${PORT}/`);
