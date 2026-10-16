@@ -13,6 +13,8 @@ const { checkMinecraft, writeVarInt, readVarInt, packet, mcString, MAGIC } = req
 const { checkProxmox } = require('../lib/proxmox');
 const { applyDegraded } = require('../lib/monitor');
 const { inRecurringWindow, maintenanceActive, describeRecurrence } = require('../lib/schedule');
+const { checkDatabase } = require('../lib/database');
+const { sendMail } = require('../lib/smtp');
 
 const servers = [];
 let proc, base, cookie = '';
@@ -303,4 +305,127 @@ test('widget : /embed intégrable en iframe, le reste non', async () => {
   assert.strictEqual(e.headers.get('x-frame-options'), null);
   const h = await fetch(base + '/');
   assert.strictEqual(h.headers.get('x-frame-options'), 'SAMEORIGIN');
+});
+
+// ───────── v1.4 ─────────
+function tcpFake(onConn) { const srv = net.createServer(onConn); servers.push(srv); return listen(srv); }
+
+test('MySQL / MariaDB : version lue dans le handshake, refus d’hôte = joignable', async () => {
+  const port = await tcpFake((sock) => {
+    const payload = Buffer.concat([Buffer.from([10]), Buffer.from('10.11.6-MariaDB\0'), Buffer.alloc(20)]);
+    const head = Buffer.alloc(4); head.writeUIntLE(payload.length, 0, 3); head[3] = 0;
+    sock.write(Buffer.concat([head, payload])); sock.on('error', () => {});
+  });
+  const r = await checkDatabase({ dbKind: 'mysql', hostname: '127.0.0.1', port, timeout: 5 });
+  assert.match(r.msg, /MariaDB 10\.11\.6/);
+  const port2 = await tcpFake((sock) => {
+    const msg = Buffer.from("Host '1.2.3.4' is not allowed to connect");
+    const payload = Buffer.concat([Buffer.from([0xff, 0x6a, 0x04]), msg]);
+    const head = Buffer.alloc(4); head.writeUIntLE(payload.length, 0, 3);
+    sock.write(Buffer.concat([head, payload])); sock.on('error', () => {});
+  });
+  const r2 = await checkDatabase({ dbKind: 'mysql', hostname: '127.0.0.1', port: port2, timeout: 5 });
+  assert.match(r2.msg, /joignable.*not allowed/);
+});
+
+test('PostgreSQL : réponse à la SSLRequest', async () => {
+  const port = await tcpFake((sock) => { sock.on('data', () => sock.write('N')); sock.on('error', () => {}); });
+  const r = await checkDatabase({ dbKind: 'postgres', hostname: '127.0.0.1', port, timeout: 5 });
+  assert.match(r.msg, /PostgreSQL joignable/);
+});
+
+test('Redis : AUTH, PING, version ; mauvais mot de passe', async () => {
+  const port = await tcpFake((sock) => {
+    sock.on('data', (d) => {
+      const c = d.toString();
+      if (c.startsWith('AUTH')) sock.write(c.includes('bon-mdp') ? '+OK\r\n' : '-WRONGPASS invalid password\r\n');
+      else if (c.startsWith('PING')) sock.write('+PONG\r\n');
+      else if (c.startsWith('INFO')) { const body = '# Server\r\nredis_version:7.2.4\r\n'; sock.write(`$${body.length}\r\n${body}\r\n`); }
+    });
+    sock.on('error', () => {});
+  });
+  const r = await checkDatabase({ dbKind: 'redis', hostname: '127.0.0.1', port, dbPassword: 'bon-mdp', timeout: 5 });
+  assert.match(r.msg, /Redis 7\.2\.4/);
+  await assert.rejects(checkDatabase({ dbKind: 'redis', hostname: '127.0.0.1', port, dbPassword: 'faux', timeout: 5 }), /WRONGPASS/);
+});
+
+// Faux serveur SMTP (sans TLS)
+function fakeSmtp(store) {
+  return tcpFake((sock) => {
+    let data = false, buf = '';
+    sock.write('220 fake ESMTP\r\n');
+    sock.on('data', (d) => {
+      buf += d.toString();
+      if (data) {
+        if (buf.endsWith('\r\n.\r\n')) { store.push(buf); buf = ''; data = false; sock.write('250 OK queued\r\n'); }
+        return;
+      }
+      let i;
+      while ((i = buf.indexOf('\r\n')) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 2);
+        store.cmds = (store.cmds || []).concat(line);
+        if (/^EHLO/i.test(line)) sock.write('250-fake\r\n250 AUTH PLAIN LOGIN\r\n');
+        else if (/^AUTH PLAIN/i.test(line)) sock.write(Buffer.from(line.slice(11), 'base64').toString().endsWith('\0secret') ? '235 OK\r\n' : '535 bad auth\r\n');
+        else if (/^MAIL|^RCPT/i.test(line)) sock.write('250 OK\r\n');
+        else if (/^DATA/i.test(line)) { data = true; sock.write('354 go\r\n'); }
+        else if (/^QUIT/i.test(line)) sock.end('221 bye\r\n');
+      }
+    });
+    sock.on('error', () => {});
+  });
+}
+
+test('SMTP : envoi d’un email avec authentification', async () => {
+  const store = [];
+  const port = await fakeSmtp(store);
+  await sendMail({ host: '127.0.0.1', port, user: 'alertes@craftpick.fr', pass: 'secret', from: 'Craftpick <alertes@craftpick.fr>', to: 'louis@craftpick.fr, admin@craftpick.fr', subject: '🔴 Survie hors ligne', text: 'Le serveur ne répond plus' });
+  assert.strictEqual(store.length, 1);
+  assert.ok(store.cmds.includes('RCPT TO:<admin@craftpick.fr>'));
+  assert.match(store[0], /Subject: =\?UTF-8\?B\?/);
+  const body = store[0].split('\r\n\r\n')[1].replace(/\r\n|\./g, '');
+  assert.match(Buffer.from(body, 'base64').toString(), /ne répond plus/);
+  await assert.rejects(sendMail({ host: '127.0.0.1', port, user: 'x', pass: 'faux', from: 'a@b.c', to: 'd@e.f', subject: 's', text: 't' }), /535/);
+});
+
+test('notification email via l’API de test', async () => {
+  const store = [];
+  const port = await fakeSmtp(store);
+  const r = (await call('POST', '/api/notifications/test', { name: 'Mail', type: 'email', config: { smtpHost: '127.0.0.1', smtpPort: String(port), smtpUser: 'u', smtpPass: 'secret', mailFrom: 'a@craftpick.fr', mailTo: 'louis@craftpick.fr' } })).body;
+  assert.strictEqual(r.ok, true, r.error);
+  assert.strictEqual(store.length, 1);
+});
+
+test('page détaillée d’un service : public oui, privé non', async () => {
+  const pub = (await call('POST', '/api/monitors', { name: 'Détail', type: 'push', interval: 60 })).body;
+  const priv = (await call('POST', '/api/monitors', { name: 'Caché', type: 'push', interval: 60, isPublic: false })).body;
+  await call('GET', pub.pushPath + '?ping=42');
+  const r = await call('GET', `/api/service/${pub.id}?hours=24`, undefined, false);
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual(r.body.monitor.name, 'Détail');
+  assert.ok(r.body.series.length >= 1);
+  assert.strictEqual(r.body.monitor.config, undefined); // jamais la config en public
+  assert.strictEqual((await call('GET', `/api/service/${priv.id}`, undefined, false)).status, 404);
+  assert.strictEqual((await fetch(`${base}/service/${pub.id}`)).status, 200);
+});
+
+test('personnalisation : accent, bannière, CSS', async () => {
+  assert.strictEqual((await call('PUT', '/api/settings', { title: 'Craftpick Status', accentColor: 'rouge' })).status, 400);
+  await call('PUT', '/api/settings', { title: 'Craftpick Status', accentColor: '#ff8800', banner: { text: 'Event ce soir 21h', level: 'event', link: 'javascript:alert(1)' }, customCss: 'h1{color:red}</style><script>x</script>' });
+  const s = (await call('GET', '/api/status', undefined, false)).body;
+  assert.strictEqual(s.accentColor, '#ff8800');
+  assert.strictEqual(s.banner.text, 'Event ce soir 21h');
+  assert.strictEqual(s.banner.link, ''); // lien non http(s) refusé
+  assert.ok(!/<\/style/i.test(s.customCss));
+});
+
+test('sauvegardes : création, liste, téléchargement, noms protégés', async () => {
+  const r = (await call('POST', '/api/backups', {})).body;
+  assert.match(r.name, /^db-\d{4}-\d{2}-\d{2}\.json$/);
+  const list = (await call('GET', '/api/backups')).body;
+  assert.ok(list.some((b) => b.name === r.name));
+  const dl = await call('GET', '/api/backups/' + r.name);
+  assert.strictEqual(dl.status, 200);
+  assert.ok(Array.isArray(dl.body.monitors));
+  assert.strictEqual((await call('GET', '/api/backups/..%2Fdb.json')).status, 404);
+  assert.strictEqual((await call('GET', '/api/backups', undefined, false)).status, 401);
 });

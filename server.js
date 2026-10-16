@@ -95,9 +95,9 @@ function readBody(req) {
 const clamp = (v, min, max, def) => { const n = Number(v); return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def; };
 const str = (v, max = 500) => (v == null ? '' : String(v).slice(0, max));
 
-const MONITOR_TYPES = ['http', 'keyword', 'json', 'tcp', 'ping', 'dns', 'push', 'minecraft', 'proxmox'];
+const MONITOR_TYPES = ['http', 'keyword', 'json', 'tcp', 'ping', 'dns', 'push', 'minecraft', 'proxmox', 'database'];
 // Champs secrets : jamais renvoyés au navigateur ; laissés vides dans le formulaire = valeur conservée
-const SECRET_FIELDS = ['basicAuthPass', 'pveTokenSecret'];
+const SECRET_FIELDS = ['basicAuthPass', 'pveTokenSecret', 'dbPassword'];
 function sanitizeMonitor(b, existing = {}) {
   b = { ...b };
   for (const f of SECRET_FIELDS) if (!b[f] && existing[f]) b[f] = existing[f];
@@ -144,6 +144,10 @@ function sanitizeMonitor(b, existing = {}) {
     notifyDegraded: !!b.notifyDegraded,
     // Minecraft
     mcEdition: b.mcEdition === 'bedrock' ? 'bedrock' : 'java',
+    // Base de données
+    dbKind: ['mysql', 'postgres', 'redis'].includes(b.dbKind) ? b.dbKind : 'mysql',
+    dbUser: str(b.dbUser, 100),
+    dbPassword: str(b.dbPassword, 200),
     // Proxmox
     pveNode: str(b.pveNode, 100),
     pveTokenId: str(b.pveTokenId, 200),
@@ -154,7 +158,7 @@ function sanitizeMonitor(b, existing = {}) {
     pveDisk: clamp(b.pveDisk, 0, 100, 0),
   };
   if (['http', 'keyword', 'json', 'proxmox'].includes(m.type) && !/^https?:\/\//i.test(m.url)) throw new Error("L'URL doit commencer par http:// ou https://");
-  if (['tcp', 'ping', 'dns', 'minecraft'].includes(m.type) && !m.hostname) throw new Error('Nom d’hôte requis');
+  if (['tcp', 'ping', 'dns', 'minecraft', 'database'].includes(m.type) && !m.hostname) throw new Error('Nom d’hôte requis');
   if (m.parentId) {
     if (!db.data.monitors.some((x) => x.id === m.parentId)) m.parentId = null;
     else {
@@ -216,6 +220,7 @@ function target(m) {
   if (['http', 'keyword', 'json'].includes(m.type)) return m.url;
   if (m.type === 'push') return 'Push (heartbeat)';
   if (m.type === 'proxmox') return `${m.url} · nœud ${m.pveNode}`;
+  if (m.type === 'database') return `${{ mysql: 'MySQL', postgres: 'PostgreSQL', redis: 'Redis' }[m.dbKind]} · ${m.hostname}${m.port ? ':' + m.port : ''}`;
   if (m.type === 'minecraft') return m.hostname + (m.port ? ':' + m.port : '') + (m.mcEdition === 'bedrock' ? ' (Bedrock)' : '');
   return m.hostname + (m.port && m.type === 'tcp' ? ':' + m.port : '');
 }
@@ -365,6 +370,7 @@ function buildStatus(page) {
   const meta = page
     ? { title: page.title, description: page.description, logoUrl: page.logoUrl || s.logoUrl || '', footer: page.footer || s.footer || '', page: page.slug }
     : { title: s.title, description: s.description, logoUrl: s.logoUrl || '', footer: s.footer || '' };
+  Object.assign(meta, { accentColor: s.accentColor || '', banner: s.banner && s.banner.text ? s.banner : null, customCss: s.customCss || '' });
   const base = (s.publicUrl || '').replace(/\/+$/, '');
   return { ...meta, monitors, incidents, setup: !s.adminHash, url: base ? base + (page ? '/s/' + page.slug : '/') : '' };
 }
@@ -379,6 +385,41 @@ route('GET', '/api/incidents/history', (req, res, p, q) => {
   const list = visibleIncidents(visibleMonitorIds(r.page)).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 100);
   send(res, 200, list);
 });
+// Page détaillée d'un service : ?page=<slug> si le service n'est visible que sur une page dédiée
+route('GET', '/api/service/:id', (req, res, p, q) => {
+  const r = resolvePage(req, res, q);
+  if (!r) return;
+  const id = Number(p.id);
+  const ids = visibleMonitorIds(r.page);
+  const m = db.data.monitors.find((x) => x.id === id && x.active);
+  if (!m || !ids.has(id)) return send(res, 404, { error: 'Service introuvable' });
+  const hours = clamp(q.get('hours'), 1, 168, 24);
+  const since = Date.now() - hours * 3600e3;
+  // échantillonnage : ~300 points (ping moyen, pire statut, joueurs max)
+  const raw = (db.data.beats[id] || []).filter((b) => b.t >= since);
+  const size = Math.max(1, Math.ceil(raw.length / 300));
+  const rank = { 0: 5, 4: 4, 3: 3, 2: 2, 1: 1 };
+  const series = [];
+  for (let i = 0; i < raw.length; i += size) {
+    const g = raw.slice(i, i + size);
+    const pings = g.filter((b) => typeof b.p === 'number').map((b) => b.p);
+    const pls = g.filter((b) => b.pl != null).map((b) => b.pl);
+    series.push({
+      t: g[g.length - 1].t,
+      s: g.reduce((w, b) => ((rank[b.s] || 0) > (rank[w] || 0) ? b.s : w), g[0].s),
+      p: pings.length ? Math.round(pings.reduce((a, b) => a + b, 0) / pings.length) : null,
+      ...(pls.length ? { pl: Math.max(...pls) } : {}),
+    });
+  }
+  const s = db.data.settings;
+  send(res, 200, {
+    site: { title: r.page ? r.page.title : s.title, logoUrl: (r.page && r.page.logoUrl) || s.logoUrl || '', accentColor: s.accentColor || '', customCss: s.customCss || '', page: r.page ? r.page.slug : null },
+    monitor: monitorSummary(m, false),
+    series,
+    incidents: visibleIncidents(ids).filter((i) => (i.monitorIds || []).includes(id)).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 20),
+  });
+});
+
 // Déverrouillage d'une page protégée par mot de passe
 route('POST', '/api/pages/:slug/unlock', async (req, res, p) => {
   const page = findPage(p.slug);
@@ -587,7 +628,7 @@ route('DELETE', '/api/incidents/:id', (req, res, p) => {
 }, true);
 
 // Notifications (admin)
-const NTYPES = ['discord', 'slack', 'telegram', 'webhook', 'ntfy', 'gotify', 'pushover'];
+const NTYPES = ['discord', 'slack', 'telegram', 'webhook', 'ntfy', 'gotify', 'pushover', 'email'];
 function sanitizeNotif(b, existing = {}) {
   const c = b.config || {};
   return {
@@ -596,7 +637,8 @@ function sanitizeNotif(b, existing = {}) {
     type: NTYPES.includes(b.type) ? b.type : 'webhook',
     applyAll: !!b.applyAll,
     active: b.active !== false,
-    config: { webhookUrl: str(c.webhookUrl, 1000), username: str(c.username, 100), botToken: str(c.botToken, 200), chatId: str(c.chatId, 100), url: str(c.url, 1000), server: str(c.server, 500), topic: str(c.topic, 200), token: str(c.token, 200), userKey: str(c.userKey, 200) },
+    config: { webhookUrl: str(c.webhookUrl, 1000), username: str(c.username, 100), botToken: str(c.botToken, 200), chatId: str(c.chatId, 100), url: str(c.url, 1000), server: str(c.server, 500), topic: str(c.topic, 200), token: str(c.token, 200), userKey: str(c.userKey, 200),
+      smtpHost: str(c.smtpHost, 200), smtpPort: str(c.smtpPort, 6), smtpSecure: !!c.smtpSecure, smtpUser: str(c.smtpUser, 200), smtpPass: str(c.smtpPass, 200), mailFrom: str(c.mailFrom, 200), mailTo: str(c.mailTo, 1000) },
   };
 }
 route('GET', '/api/notifications', (req, res) => send(res, 200, db.data.notifications), true);
@@ -648,9 +690,11 @@ route('DELETE', '/api/pages/:id', (req, res, prm) => {
 
 // Paramètres (admin)
 route('GET', '/api/settings', (req, res) => {
-  const { title, description, logoUrl, footer, publicUrl, discordLive: dl, weeklyReport: wr } = db.data.settings;
+  const { title, description, logoUrl, footer, publicUrl, discordLive: dl, weeklyReport: wr, accentColor, banner, customCss } = db.data.settings;
   send(res, 200, {
     title, description, logoUrl: logoUrl || '', footer: footer || '', publicUrl: publicUrl || '',
+    accentColor: accentColor || '', banner: { text: '', level: 'info', link: '', ...(banner || {}) }, customCss: customCss || '',
+    backups: db.listBackups(),
     discordLive: { enabled: false, webhookUrl: '', page: '', username: '', ...(dl || {}) },
     weeklyReport: { enabled: false, day: 1, hour: 9, notificationIds: [], ...(wr || {}) },
     pages: db.data.pages.map((pg) => ({ slug: pg.slug, title: pg.title, protected: !!pg.passwordHash })),
@@ -663,6 +707,12 @@ route('PUT', '/api/settings', async (req, res) => {
   s.description = str(b.description, 500);
   s.logoUrl = str(b.logoUrl, 1000);
   s.footer = str(b.footer, 500);
+  if (b.accentColor !== undefined) {
+    if (b.accentColor && !/^#[0-9a-f]{6}$/i.test(b.accentColor)) return send(res, 400, { error: 'Couleur invalide (format #rrggbb)' });
+    s.accentColor = b.accentColor || '';
+  }
+  if (b.banner) s.banner = { text: str(b.banner.text, 300), level: ['info', 'success', 'warning', 'event'].includes(b.banner.level) ? b.banner.level : 'info', link: /^https?:\/\//.test(b.banner.link || '') ? str(b.banner.link, 500) : '' };
+  if (b.customCss !== undefined) s.customCss = str(b.customCss, 20000).replace(/<\/style/gi, '');
   if (b.publicUrl !== undefined) {
     s.publicUrl = str(b.publicUrl, 300).replace(/\/+$/, '');
     if (s.publicUrl && !/^https?:\/\//.test(s.publicUrl)) return send(res, 400, { error: "L'URL publique doit commencer par http:// ou https://" });
@@ -732,6 +782,20 @@ setInterval(() => {
   sendWeeklyReport().then((r) => console.log(`[rapport] envoyé (${r.sent})`, r.errors.join(' ; ')));
 }, 5 * 60000).unref();
 
+// Sauvegardes automatiques
+route('GET', '/api/backups', (req, res) => send(res, 200, db.listBackups()), true);
+route('POST', '/api/backups', (req, res) => { const name = db.backup(true); send(res, 200, { ok: true, name, backups: db.listBackups() }); }, true);
+route('GET', '/api/backups/:name', (req, res, p) => {
+  const file = db.backupPath(p.name);
+  if (!file || !fs.existsSync(file)) return send(res, 404, { error: 'Sauvegarde introuvable' });
+  res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Disposition': `attachment; filename="${p.name}"` });
+  fs.createReadStream(file).pipe(res);
+}, true);
+// une sauvegarde par jour (vérifiée au démarrage puis toutes les heures)
+const dailyBackup = () => { try { const n = db.backup(); if (n) console.log('[sauvegarde]', n); } catch (e) { console.error('[sauvegarde]', e.message); } };
+setTimeout(dailyBackup, 10000).unref();
+setInterval(dailyBackup, 3600e3).unref();
+
 route('GET', '/api/export', (req, res) => {
   const { monitors, incidents, notifications, pages } = db.data;
   res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Disposition': 'attachment; filename="craftpick-status-backup.json"' });
@@ -777,6 +841,7 @@ function serveStatic(req, res, pathname) {
   else if (pathname === '/admin' || pathname === '/admin/') pathname = '/admin.html';
   else if (pathname === '/history') pathname = '/history.html';
   else if (pathname === '/embed' || pathname === '/embed/') pathname = '/embed.html';
+  else if (/^\/service\/\d+\/?$/.test(pathname) || /^\/s\/[a-z0-9-]+\/service\/\d+\/?$/i.test(pathname)) pathname = '/service.html';
   else if (/^\/s\/[a-z0-9-]+\/?$/i.test(pathname)) pathname = '/status.html';
   else if (/^\/s\/[a-z0-9-]+\/history\/?$/i.test(pathname)) pathname = '/history.html';
   const file = path.normalize(path.join(PUBLIC_DIR, pathname));

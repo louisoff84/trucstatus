@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Service</title>
+  <link rel="icon" href="/favicon.svg">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    .svc-chart { width: 100%; height: 220px; display: block; }
+    .stats { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
+    .svc-chart .grid { stroke: var(--border); stroke-width: 1; }
+    .svc-chart text { fill: var(--muted); font-size: 11px; font-family: Inter, system-ui, sans-serif; }
+    .svc-chart .hit { fill: transparent; }
+    .svc-chart .hit:hover { fill: color-mix(in srgb, var(--text) 8%, transparent); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="pub-header">
+      <div class="brand"><img id="logo" class="hidden" alt=""><div><h1 id="site" style="font-size:20px">Status</h1></div></div>
+      <div style="display:flex;gap:4px"><a class="btn sm ghost" id="back" href="/">← Tous les services</a><button class="btn sm ghost theme-toggle" title="Thème">🌓</button></div>
+    </header>
+    <div id="root"><p class="muted">Chargement…</p></div>
+    <footer class="pub-footer"><span id="updated">—</span></footer>
+  </div>
+  <script src="/common.js"></script>
+  <script>
+    const mPage = location.pathname.match(/^\/s\/([a-z0-9-]+)\/service\/(\d+)/i);
+    const mMain = location.pathname.match(/^\/service\/(\d+)/);
+    const PAGE = mPage ? mPage[1] : null;
+    const ID = Number(mPage ? mPage[2] : mMain && mMain[1]);
+    const home = PAGE ? '/s/' + PAGE : '/';
+    $('#back').href = home;
+    let hours = 24, mode = 'ping', data = null, last = Date.now();
+
+    function chartSVG(series) {
+      const W = 800, H = 220, pad = { l: 46, r: 8, t: 10, b: 24 };
+      const players = mode === 'players';
+      const val = (b) => (players ? b.pl : b.p);
+      const pts = series.filter((b) => val(b) != null);
+      const now = Date.now(), t0 = now - hours * 3600e3;
+      const max = Math.max(players ? 5 : 50, ...pts.map(val)) * 1.15;
+      const x = (t) => pad.l + ((t - t0) / (now - t0)) * (W - pad.l - pad.r);
+      const y = (v) => pad.t + (1 - v / max) * (H - pad.t - pad.b);
+      let g = '';
+      for (let i = 0; i <= 4; i++) { const v = (max / 4) * i; g += `<line class="grid" x1="${pad.l}" x2="${W - pad.r}" y1="${y(v)}" y2="${y(v)}"/><text x="${pad.l - 6}" y="${y(v) + 4}" text-anchor="end">${Math.round(v)}${players ? '' : ' ms'}</text>`; }
+      for (let i = 0; i <= 4; i++) {
+        const t = t0 + ((now - t0) / 4) * i, d = new Date(t);
+        const lbl = hours > 24 ? d.toLocaleDateString('fr-FR', { weekday: 'short', day: 'numeric' }) : d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+        g += `<text x="${Math.min(W - 30, Math.max(pad.l + 20, x(t)))}" y="${H - 6}" text-anchor="middle">${lbl}</text>`;
+      }
+      // bandes de panne / dégradation / maintenance
+      const col = { 0: 'var(--down)', 4: 'var(--degraded)', 3: 'var(--maint)' };
+      for (const b of series) if (col[b.s]) g += `<rect x="${x(b.t) - 2}" y="${pad.t}" width="4" height="${H - pad.t - pad.b}" fill="${col[b.s]}" opacity=".18"/>`;
+      if (!pts.length) return `<svg class="svc-chart" viewBox="0 0 ${W} ${H}">${g}<text x="${W / 2}" y="${H / 2}" text-anchor="middle">Pas encore de données</text></svg>`;
+      const line = pts.map((b, i) => `${i ? 'L' : 'M'}${x(b.t).toFixed(1)} ${y(val(b)).toFixed(1)}`).join(' ');
+      const area = `${line} L${x(pts[pts.length - 1].t).toFixed(1)} ${y(0)} L${x(pts[0].t).toFixed(1)} ${y(0)} Z`;
+      const color = players ? 'var(--maint)' : 'var(--up)';
+      const step = (W - pad.l - pad.r) / Math.max(1, series.length);
+      const hits = series.map((b) => `<rect class="hit" x="${x(b.t) - step / 2}" y="${pad.t}" width="${step}" height="${H - pad.t - pad.b}" data-tip="${esc(`<b>${fmtDate(b.t)}</b><br>${STATUS_LABEL[b.s]}${b.p != null ? ' · ' + b.p + ' ms' : ''}${b.pl != null ? ' · ' + b.pl + ' joueur(s)' : ''}`)}"/>`).join('');
+      return `<svg class="svc-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+        <defs><linearGradient id="gr" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="${color}" stop-opacity=".35"/><stop offset="1" stop-color="${color}" stop-opacity="0"/></linearGradient></defs>
+        ${g}<path d="${area}" fill="url(#gr)"/><path d="${line}" fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>${hits}</svg>`;
+    }
+
+    // Calendrier 90 jours (colonnes = semaines, lignes = lundi → dimanche)
+    function calendarHTML(bars) {
+      const first = new Date(bars[0].d + 'T12:00:00');
+      const pad = (first.getDay() + 6) % 7;
+      return `<div class="cal">${'<i class="pad"></i>'.repeat(pad)}${bars.map((b) => `<i class="${dayClass(b)}" data-tip="${esc(`<b>${fmtDay(b.d)}</b><br>${b.u == null ? 'Aucune donnée' : 'Disponibilité : ' + fmtPct(b.u)}${b.down ? `<br>${b.down} vérification(s) en échec` : ''}${b.dg ? `<br>${b.dg} vérification(s) dégradée(s)` : ''}`)}"></i>`).join('')}</div>`;
+    }
+
+    function render() {
+      const { site, monitor: m, series, incidents } = data;
+      applyBranding(site);
+      document.title = `${m.name} — ${site.title}`;
+      $('#site').textContent = site.title;
+      if (site.logoUrl) { $('#logo').src = site.logoUrl; $('#logo').classList.remove('hidden'); }
+      const mc = m.mc;
+      $('#root').innerHTML = `
+        <div class="card panel">
+          <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><span class="dot s${m.status}" style="width:14px;height:14px"></span><h2 style="font-size:26px">${esc(m.name)}</h2><span class="pill s${m.status}">${STATUS_LABEL[m.status]}</span></div>
+          ${m.description ? `<p class="muted" style="margin:8px 0 0">${esc(m.description)}</p>` : ''}
+          ${m.target ? `<p class="small" style="margin:6px 0 0"><span class="muted">Cible :</span> ${esc(m.target)}</p>` : ''}
+          ${mc ? `<p class="small" style="margin:8px 0 0">👥 <b>${mc.online}/${mc.max}</b> joueurs · ${esc(mc.version || '')}${mc.motd ? ` · <span class="muted">${esc(mc.motd)}</span>` : ''}</p>` : ''}
+          <div class="bars" style="margin-top:16px;height:28px">${beatBarsHTML(m.recent, 60)}</div>
+        </div>
+        <div class="stats" style="margin-bottom:20px">
+          <div class="card stat"><div class="k">Réponse actuelle</div><div class="v">${m.ping ?? '—'}<small>${m.ping != null ? ' ms' : ''}</small></div></div>
+          <div class="card stat"><div class="k">Moyenne 24 h</div><div class="v">${m.avgPing24 ?? '—'}<small>${m.avgPing24 != null ? ' ms' : ''}</small></div></div>
+          <div class="card stat"><div class="k">Disponibilité 24 h</div><div class="v">${fmtPct(m.uptime24)}</div></div>
+          <div class="card stat"><div class="k">7 jours</div><div class="v">${fmtPct(m.uptime7)}</div></div>
+          <div class="card stat"><div class="k">30 jours</div><div class="v">${fmtPct(m.uptime30)}</div></div>
+          <div class="card stat"><div class="k">90 jours</div><div class="v">${fmtPct(m.uptime90)}</div></div>
+        </div>
+        <div class="card panel">
+          <div class="panel-head"><h3>${mode === 'players' ? 'Joueurs connectés' : 'Temps de réponse'}</h3>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              ${mc || m.players24 ? `<div class="tabs" id="modes"><button data-m="ping" class="${mode === 'ping' ? 'on' : ''}">Ping</button><button data-m="players" class="${mode === 'players' ? 'on' : ''}">Joueurs</button></div>` : ''}
+              <div class="tabs" id="ranges"><button data-h="24" class="${hours === 24 ? 'on' : ''}">24 h</button><button data-h="168" class="${hours === 168 ? 'on' : ''}">7 jours</button></div>
+            </div>
+          </div>
+          ${chartSVG(series)}
+        </div>
+        <div class="card panel">
+          <div class="panel-head"><h3>Calendrier de disponibilité (90 jours)</h3><span class="muted small">${fmtPct(m.uptime90)}</span></div>
+          ${calendarHTML(m.bars)}
+          <div class="small muted" style="display:flex;gap:14px;flex-wrap:wrap;margin-top:10px">
+            <span><span class="dot s1" style="animation:none;border-radius:3px"></span> ≥ 99,9 %</span><span><span class="dot s4" style="border-radius:3px"></span> dégradé</span><span><span class="dot s2" style="border-radius:3px"></span> ≥ 95 %</span><span><span class="dot s0" style="border-radius:3px"></span> &lt; 95 %</span>
+          </div>
+        </div>
+        <div class="section-title">Incidents liés à ce service</div>
+        ${incidents.length ? incidents.map((i) => `<div class="card incident ${i.status === 'resolved' ? 'resolved' : esc(i.severity)}">
+          <h3>${esc(i.title)} <span class="pill ${i.status === 'resolved' ? 's1' : 's2'}">${esc(INC_STATUS[i.status] || i.status)}</span></h3>
+          <div class="when">${fmtDate(i.createdAt)}${i.resolvedAt ? ' → ' + fmtDate(i.resolvedAt) : ''}${i.recurrenceText ? ' · 🔁 ' + esc(i.recurrenceText) : ''}</div>
+          ${(i.updates || []).slice(-1).map((u) => `<p style="margin-top:8px">${esc(u.text)}</p>`).join('')}
+        </div>`).join('') : '<div class="card" style="padding:18px 20px"><span class="muted">Aucun incident enregistré pour ce service. 🎉</span></div>'}`;
+      $$('#ranges button').forEach((b) => (b.onclick = () => { hours = Number(b.dataset.h); load(); }));
+      $$('#modes button').forEach((b) => (b.onclick = () => { mode = b.dataset.m; render(); }));
+    }
+
+    async function load() {
+      try {
+        data = await api(`/api/service/${ID}?hours=${hours}${PAGE ? '&page=' + encodeURIComponent(PAGE) : ''}`);
+        last = Date.now();
+        render();
+      } catch (e) {
+        $('#root').innerHTML = `<div class="card" style="padding:20px">${e.status === 401 ? `🔒 Page protégée. <a href="${home}">Déverrouille-la d'abord</a>.` : e.status === 404 ? 'Service introuvable.' : 'Impossible de charger ce service.'}</div>`;
+      }
+    }
+    setInterval(() => { $('#updated').textContent = `Mis à jour ${ago(last)}`; }, 1000);
+    let t;
+    liveEvents(({ monitorId }) => { if (monitorId === ID) { clearTimeout(t); t = setTimeout(load, 1500); } }, load, PAGE);
+    load();
+  </script>
+</body>
+</html>

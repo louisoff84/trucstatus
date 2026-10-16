@@ -39,6 +39,7 @@ Les données sont stockées dans `./data`, monté comme volume.
 - Port TCP, ping ICMP (Windows et Linux), DNS (A, AAAA, MX, TXT…, serveur personnalisé)
 - **Push / heartbeat** : ton script ou ton cron appelle une URL ; s'il ne le fait plus dans le délai prévu, le monitor passe hors ligne
 - **Serveur Minecraft** (Java et Bedrock) : joueurs connectés, version, MOTD, courbe de fréquentation ; SRV `_minecraft._tcp` pris en charge
+- **Bases de données** : MySQL/MariaDB (version via le handshake), PostgreSQL (SSLRequest), Redis (AUTH + PING + version) — sans identifiants pour MySQL/PostgreSQL
 - **Nœud Proxmox VE** via l'API : CPU, RAM, disque, uptime, VM/CT ; panne si une VM surveillée s'arrête, « Dégradé » si un seuil est dépassé
 - **Statut « Dégradé »** : le service répond, mais au-delà d'un seuil de temps de réponse (orange, compté comme disponible, notification optionnelle)
 - Tentatives avant alerte, intervalle accéléré en cas de panne, **rappels réguliers tant que le service reste en panne**
@@ -49,6 +50,8 @@ Les données sont stockées dans `./data`, monté comme volume.
 **Page publique**
 - Bandeau d'état global, groupes de services, barres de disponibilité sur 90 jours
 - Incidents et maintenances avec suivi des mises à jour, historique sur `/history`
+- **Page détaillée par service** (`/service/<id>`) : graphique ping / joueurs sur 24 h ou 7 jours, calendrier de disponibilité sur 90 jours, incidents liés
+- **Personnalisation** : couleur d'accent, bannière d'annonce (ex. « Event ce soir 21h »), CSS personnalisé
 - Temps réel (SSE), thème auto / clair / sombre
 - Flux RSS des incidents : `/api/feed.xml`
 - Badges SVG : `/api/badge/<id>`
@@ -60,9 +63,10 @@ Les données sont stockées dans `./data`, monté comme volume.
 - **Message Discord en direct** : un message unique dans ton salon, modifié automatiquement (état, joueurs, incidents)
 - **Rapport hebdomadaire** de disponibilité (uptime, pannes, durée, ping, pic de joueurs) envoyé sur tes notifications
 - **Widget** à intégrer sur ton site (`/embed`, iframe)
-- Notifications : Discord, Slack, Telegram, ntfy, Gotify, Pushover, webhook JSON (avec envoi de test)
+- Notifications : Discord, Slack, Telegram, ntfy, Gotify, Pushover, **email (SMTP)**, webhook JSON (avec envoi de test)
 - Alertes du navigateur quand un service change d'état
 - Sessions conservées après un redémarrage, export / import de la configuration
+- **Sauvegardes automatiques** quotidiennes de la base (`data/backups/`, 14 conservées, `BACKUP_KEEP` pour changer)
 
 ## Monitor push
 
@@ -146,7 +150,22 @@ Le générateur de code se trouve dans *Paramètres*. Les pages protégées par 
 | `GET /api/feed.xml` | Flux RSS des incidents |
 | `GET /api/badge/<id>` | Badge SVG |
 | `GET /embed` | Widget HTML intégrable |
+| `GET /api/service/<id>` | Détail public d'un service (`?hours=24|168`, `?page=<slug>`) |
 | `GET/POST /api/push/<token>` | Réception d'un heartbeat |
+
+## Notifications email
+
+Type « Email » dans *Notifications*. Renseigne :
+- le serveur SMTP ;
+- le port : 587 pour STARTTLS, ou 465 en cochant « TLS implicite » ;
+- l'utilisateur et le mot de passe (avec Gmail : un *mot de passe d'application*) ;
+- l'expéditeur et les destinataires.
+
+Aucune dépendance : le client SMTP est intégré.
+
+## Restaurer une sauvegarde
+
+Arrête le serveur, remplace `data/db.json` par le fichier voulu de `data/backups/` (téléchargeable aussi depuis *Paramètres → Sauvegarde*), puis relance.
 
 ## Données
 

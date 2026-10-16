@@ -120,6 +120,21 @@ function sparklineSVG(values, { w = 240, h = 32 } = {}) {
   return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true"><path d="${d}" fill="none" stroke="currentColor" stroke-width="1.6" vector-effect="non-scaling-stroke" stroke-linejoin="round"/></svg>`;
 }
 
+// Personnalisation : couleur d'accent, CSS perso, bannière d'annonce
+function applyBranding(meta, bannerTarget) {
+  if (!meta) return;
+  if (meta.accentColor) document.documentElement.style.setProperty('--accent', meta.accentColor);
+  let st = document.getElementById('custom-css');
+  if (meta.customCss) {
+    if (!st) { st = document.createElement('style'); st.id = 'custom-css'; document.head.appendChild(st); }
+    st.textContent = meta.customCss;
+  } else if (st) st.remove();
+  if (bannerTarget) {
+    const b = meta.banner;
+    bannerTarget.innerHTML = b && b.text ? `<div class="banner ${esc(b.level)}">${{ info: 'ℹ️', success: '✅', warning: '⚠️', event: '🎉' }[b.level] || 'ℹ️'} <span>${esc(b.text)}</span>${b.link ? ` <a href="${esc(b.link)}" target="_blank" rel="noopener">En savoir plus →</a>` : ''}</div>` : '';
+  }
+}
+
 function liveEvents(onBeat, onRefresh, page) {
   const es = new EventSource('/api/events' + (page ? '?page=' + encodeURIComponent(page) : ''));
   es.addEventListener('beat', (e) => onBeat(JSON.parse(e.data)));

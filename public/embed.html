@@ -50,7 +50,7 @@
         <div class="w-foot"><a href="${link}" target="_blank" rel="noopener">Voir la page de status ↗</a></div>`;
     }
     async function load() {
-      try { st = await api('/api/status' + (PAGE ? '?page=' + encodeURIComponent(PAGE) : '')); render(); }
+      try { st = await api('/api/status' + (PAGE ? '?page=' + encodeURIComponent(PAGE) : '')); applyBranding({ accentColor: st.accentColor }); render(); }
       catch (e) {
         $('#w').innerHTML = `<div class="w-sum muted">${e.status === 401 ? '🔒 Page protégée — widget indisponible' : e.status === 404 ? 'Page introuvable' : 'Status indisponible'}</div>`;
       }

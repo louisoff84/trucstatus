@@ -31,7 +31,7 @@ function svcHTML(m) {
   const mc = m.mc;
   return `<div class="svc" data-id="${m.id}">
     <div class="svc-top">
-      <div class="svc-name"><span class="dot s${m.status}"></span><span>${esc(m.name)}</span></div>
+      <div class="svc-name"><span class="dot s${m.status}"></span><a class="svc-link" href="${PAGE ? '/s/' + PAGE : ''}/service/${m.id}">${esc(m.name)}</a></div>
       <div style="display:flex;gap:10px;align-items:center">
         ${mc ? `<span class="chip" title="Joueurs connectés">👥 ${mc.online}/${mc.max}</span>` : ''}
         <span class="muted small hide-sm ping">${pingText(m)}</span>
@@ -53,6 +53,7 @@ function render() {
   $('#desc').textContent = s.description || '';
   if (s.logoUrl) { $('#logo').src = s.logoUrl; $('#logo').classList.remove('hidden'); }
   $('#footer-text').textContent = s.footer || '';
+  applyBranding(s, $('#banner'));
 
   if (s.setup) {
     $('#overall').className = 'overall empty';

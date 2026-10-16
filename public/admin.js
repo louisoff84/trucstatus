@@ -5,7 +5,7 @@ let selectedId = null;
 let chartHours = 24;
 let chartBeats = [];
 
-const TYPE_LABEL = { http: 'HTTP(S)', keyword: 'HTTP(S) — Mot-clé', json: 'HTTP(S) — Requête JSON', tcp: 'Port TCP', ping: 'Ping', dns: 'DNS', push: 'Push (heartbeat)', minecraft: 'Serveur Minecraft', proxmox: 'Nœud Proxmox' };
+const TYPE_LABEL = { http: 'HTTP(S)', keyword: 'HTTP(S) — Mot-clé', json: 'HTTP(S) — Requête JSON', tcp: 'Port TCP', ping: 'Ping', dns: 'DNS', push: 'Push (heartbeat)', minecraft: 'Serveur Minecraft', proxmox: 'Nœud Proxmox', database: 'Base de données' };
 let chartMode = 'ping'; // 'ping' ou 'players' (Minecraft)
 let pages = [];
 
@@ -284,6 +284,8 @@ function extraStatsHTML(m) {
   if (x.kind === 'minecraft') return `
     <div class="card stat"><div class="k">Joueurs</div><div class="v">${x.online}<small> / ${x.max}</small></div></div>
     <div class="card stat"><div class="k">Version</div><div class="v" style="font-size:16px">${esc(x.version || '—')}</div></div>`;
+  if (x.kind === 'database') return `
+    <div class="card stat"><div class="k">Moteur</div><div class="v" style="font-size:16px">${esc({ mysql: 'MySQL / MariaDB', postgres: 'PostgreSQL', redis: 'Redis' }[x.engine] || x.engine)}</div><div class="muted small">${esc(x.version || (x.ssl != null ? (x.ssl ? 'SSL disponible' : 'SSL non activé') : ''))}</div></div>`;
   if (x.kind === 'proxmox') return `
     ${meter('CPU', x.cpu, m.config.pveCpu)}${meter('RAM', x.mem, m.config.pveMem)}${meter('Disque', x.disk, m.config.pveDisk)}
     <div class="card stat"><div class="k">VM / CT actives</div><div class="v">${x.running}<small> / ${x.total}</small></div></div>
@@ -450,6 +452,14 @@ function openMonitorForm(cfg = {}) {
         <div class="field"><label>Édition</label><select name="mcEdition"><option value="java" ${c.mcEdition !== 'bedrock' ? 'selected' : ''}>Java</option><option value="bedrock" ${c.mcEdition === 'bedrock' ? 'selected' : ''}>Bedrock</option></select></div>
         <p class="muted small" style="margin:24px 0 0">Java : port vide = enregistrement SRV puis 25565. Bedrock : 19132 par défaut (UDP).</p>
       </div>
+      <div class="t-db">
+        <div class="row3">
+          <div class="field"><label>Moteur</label><select name="dbKind">${[['mysql', 'MySQL / MariaDB'], ['postgres', 'PostgreSQL'], ['redis', 'Redis']].map(([k, v]) => `<option value="${k}" ${c.dbKind === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
+          <div class="field t-redis"><label>Utilisateur Redis (optionnel)</label><input name="dbUser" value="${esc(c.dbUser || '')}" autocomplete="off"></div>
+          <div class="field t-redis"><label>Mot de passe Redis</label><input type="password" name="dbPassword" value="" autocomplete="new-password" placeholder="${c.secretsSet && c.secretsSet.dbPassword ? '•••••••• (inchangé)' : 'optionnel'}"></div>
+        </div>
+        <p class="muted small" style="margin-top:-6px">MySQL/PostgreSQL : vérifie que le serveur répond à son protocole (aucun identifiant nécessaire). Redis : envoie PING (et AUTH si un mot de passe est saisi).</p>
+      </div>
       <fieldset class="t-pve"><legend>Proxmox VE</legend>
         <div class="row">
           <div class="field"><label>Nom du nœud</label><input name="pveNode" value="${esc(c.pveNode || '')}" placeholder="pve"></div>
@@ -540,12 +550,14 @@ function openMonitorForm(cfg = {}) {
     $$('.t-url', form).forEach((x) => x.classList.toggle('hidden', !http && t !== 'proxmox'));
     $$('.t-tls', form).forEach((x) => x.classList.toggle('hidden', !http && t !== 'proxmox'));
     $$('.t-host', form).forEach((x) => x.classList.toggle('hidden', http || t === 'push' || t === 'proxmox'));
-    $$('.t-port', form).forEach((x) => x.classList.toggle('hidden', t !== 'tcp' && t !== 'minecraft'));
+    $$('.t-port', form).forEach((x) => x.classList.toggle('hidden', t !== 'tcp' && t !== 'minecraft' && t !== 'database'));
+    $$('.t-db', form).forEach((x) => x.classList.toggle('hidden', t !== 'database'));
+    $$('.t-redis', form).forEach((x) => x.classList.toggle('hidden', form.dbKind.value !== 'redis'));
     $$('.t-mc', form).forEach((x) => x.classList.toggle('hidden', t !== 'minecraft'));
     $$('.t-pve', form).forEach((x) => x.classList.toggle('hidden', t !== 'proxmox'));
     $('#lbl-url', el).textContent = t === 'proxmox' ? 'URL de l’API Proxmox' : 'URL';
     form.url.placeholder = t === 'proxmox' ? 'https://192.168.1.10:8006' : 'https://craftpick.fr';
-    form.port.placeholder = t === 'minecraft' ? (form.mcEdition.value === 'bedrock' ? '19132' : '25565 (ou SRV)') : '443';
+    form.port.placeholder = t === 'minecraft' ? (form.mcEdition.value === 'bedrock' ? '19132' : '25565 (ou SRV)') : t === 'database' ? { mysql: '3306', postgres: '5432', redis: '6379' }[form.dbKind.value] : '443';
     if (t === 'proxmox' && !isEdit && !form.dataset.tlsSet) { form.ignoreTls.checked = true; form.dataset.tlsSet = '1'; }
     $$('.t-push', form).forEach((x) => x.classList.toggle('hidden', t !== 'push'));
     $$('.t-notpush', form).forEach((x) => x.classList.toggle('hidden', t === 'push'));
@@ -555,7 +567,7 @@ function openMonitorForm(cfg = {}) {
     $$('.t-keyword', form).forEach((x) => x.classList.toggle('hidden', t !== 'keyword'));
     $$('.t-json', form).forEach((x) => x.classList.toggle('hidden', t !== 'json'));
   };
-  form.type.onchange = sync; form.mcEdition.onchange = sync; sync();
+  form.type.onchange = sync; form.mcEdition.onchange = sync; form.dbKind.onchange = sync; sync();
   const collect = () => { const d = formData(form); d.notificationIds ||= []; return d; };
   $('#m-test', el).onclick = async () => {
     $('#test-result').innerHTML = '<span class="muted">Test en cours…</span>';
@@ -659,6 +671,7 @@ function incidentForm(i) {
 
 // Notifications
 const NOTIF_FIELDS = {
+  email: [['smtpHost', 'Serveur SMTP', 'smtp.gmail.com'], ['smtpPort', 'Port', '587 (STARTTLS) ou 465 (TLS)'], ['smtpSecure', 'TLS implicite (port 465)', '', 'checkbox'], ['smtpUser', 'Utilisateur', 'alertes@craftpick.fr'], ['smtpPass', 'Mot de passe (ou mot de passe d’application)', '', 'password'], ['mailFrom', 'Expéditeur', 'Craftpick Status <alertes@craftpick.fr>'], ['mailTo', 'Destinataires (séparés par des virgules)', 'louis@craftpick.fr']],
   discord: [['webhookUrl', 'URL du webhook Discord', 'https://discord.com/api/webhooks/…'], ['username', 'Nom du bot (optionnel)', 'Craftpick Status']],
   slack: [['webhookUrl', 'URL du webhook Slack', 'https://hooks.slack.com/services/…']],
   telegram: [['botToken', 'Token du bot', '123456:ABC…'], ['chatId', 'Chat ID', '-1001234567']],
@@ -695,9 +708,11 @@ function notifForm(n) {
       <div class="modal-foot"><button type="button" class="btn" id="n-test">Envoyer un test</button><button type="button" class="btn ghost" id="n-back">Retour</button><button class="btn primary" type="submit">Enregistrer</button></div>
     </form>`);
   const form = $('#nform', el);
-  const fields = () => { $('#n-fields', el).innerHTML = NOTIF_FIELDS[form.type.value].map(([k, l, ph]) => `<div class="field"><label>${l}</label><input data-cfg="${k}" value="${esc(n.config[k] || '')}" placeholder="${esc(ph)}"></div>`).join(''); };
+  const fields = () => { $('#n-fields', el).innerHTML = NOTIF_FIELDS[form.type.value].map(([k, l, ph, t]) => t === 'checkbox'
+    ? `<label class="check"><input type="checkbox" data-cfg="${k}" ${n.config[k] ? 'checked' : ''}> ${l}</label>`
+    : `<div class="field"><label>${l}</label><input ${t === 'password' ? 'type="password" autocomplete="new-password"' : ''} data-cfg="${k}" value="${esc(n.config[k] || '')}" placeholder="${esc(ph)}"></div>`).join(''); };
   form.type.onchange = fields; fields();
-  const collect = () => { const d = formData(form); d.config = {}; $$('[data-cfg]', el).forEach((i) => (d.config[i.dataset.cfg] = i.value)); return d; };
+  const collect = () => { const d = formData(form); d.config = {}; $$('[data-cfg]', el).forEach((i) => (d.config[i.dataset.cfg] = i.type === 'checkbox' ? i.checked : i.value)); return d; };
   $('#n-back', el).onclick = openNotifications;
   $('#n-test', el).onclick = async () => { const r = await api('/api/notifications/test', { method: 'POST', body: collect() }); r.ok ? toast('Notification de test envoyée ✓') : toast('Échec : ' + r.error, true); };
   form.onsubmit = async (e) => {
@@ -799,6 +814,16 @@ async function openSettings() {
         <div class="field"><label>URL publique de la page de status (liens Discord, flux…)</label><input name="publicUrl" value="${esc(s.publicUrl)}" placeholder="https://status.craftpick.fr"></div>
       </fieldset>
 
+      <fieldset><legend>🎨 Personnalisation</legend>
+        <div class="row">
+          <div class="field"><label>Couleur d'accent</label><div style="display:flex;gap:8px;align-items:center"><input type="color" id="ac-color" value="${esc(s.accentColor || '#2ecc71')}" style="width:56px;height:40px;padding:3px"><label class="check" style="margin:0"><input type="checkbox" id="ac-on" ${s.accentColor ? 'checked' : ''}> Utiliser</label></div></div>
+          <div class="field"><label>Bannière : style</label><select id="bn-level">${[['info', 'ℹ️ Information'], ['event', '🎉 Événement'], ['success', '✅ Bonne nouvelle'], ['warning', '⚠️ Avertissement']].map(([k, v]) => `<option value="${k}" ${s.banner.level === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
+        </div>
+        <div class="field"><label>Bannière d'annonce (vide = masquée)</label><input id="bn-text" value="${esc(s.banner.text)}" placeholder="🎉 Event PvP ce soir à 21h sur play.craftpick.fr !"></div>
+        <div class="field"><label>Lien de la bannière (optionnel)</label><input id="bn-link" value="${esc(s.banner.link)}" placeholder="https://discord.gg/craftpick"></div>
+        <div class="field"><label>CSS personnalisé (page publique, pages dédiées, widget)</label><textarea id="css" placeholder=".brand h1 { color: #ffb400; }">${esc(s.customCss)}</textarea></div>
+      </fieldset>
+
       <fieldset><legend>💬 Message Discord en direct</legend>
         <p class="muted small" style="margin-top:0">Un message unique dans ton salon, modifié automatiquement à chaque changement d'état (et toutes les 2 min pour les joueurs). Salon → Paramètres → Intégrations → Webhooks.</p>
         <label class="check"><input type="checkbox" id="dl-on" ${dl.enabled ? 'checked' : ''}> Activer</label>
@@ -842,7 +867,10 @@ async function openSettings() {
         <div class="actions" style="margin-bottom:12px">
           <a class="btn" href="/api/export">⬇ Exporter la configuration</a>
           <label class="btn" style="margin:0;color:var(--text)">⬆ Importer<input type="file" accept=".json" id="imp" hidden></label>
+          <button type="button" class="btn" id="bk-now">💾 Sauvegarder maintenant</button>
         </div>
+        <p class="muted small" style="margin-top:0">Sauvegarde automatique chaque jour dans <code>data/backups/</code> (14 dernières conservées).</p>
+        <div id="bk-list" style="margin-bottom:12px"></div>
       </fieldset>
       <div class="modal-foot"><button type="button" class="btn ghost" onclick="closeModal()">Annuler</button><button class="btn primary" type="submit">Enregistrer</button></div>
     </form>`, true);
@@ -861,8 +889,16 @@ async function openSettings() {
   ['#wg-page', '#wg-theme', '#wg-up'].forEach((sel) => ($(sel, el).onchange = widget));
   widget();
 
+  const paintBackups = (list) => {
+    $('#bk-list', el).innerHTML = list.length ? list.slice(0, 14).map((b) => `<div class="list-item" style="padding:8px 12px"><span class="small">${esc(b.name)} <span class="muted">· ${Math.round(b.size / 1024)} Ko · ${fmtDate(b.date)}</span></span><a class="btn sm" href="/api/backups/${encodeURIComponent(b.name)}">⬇</a></div>`).join('') : '<p class="muted small">Aucune sauvegarde pour le moment.</p>';
+  };
+  paintBackups(s.backups || []);
+  $('#bk-now', el).onclick = async () => { const r = await api('/api/backups', { method: 'POST' }); paintBackups(r.backups); toast('Sauvegarde créée ✓'); };
   const collect = () => {
     const d = formData($('#sform', el));
+    d.accentColor = $('#ac-on', el).checked ? $('#ac-color', el).value : '';
+    d.banner = { text: $('#bn-text', el).value, level: $('#bn-level', el).value, link: $('#bn-link', el).value.trim() };
+    d.customCss = $('#css', el).value;
     d.discordLive = { enabled: $('#dl-on', el).checked, webhookUrl: $('#dl-url', el).value.trim(), page: $('#dl-page', el).value, username: $('#dl-name', el).value };
     d.weeklyReport = { enabled: $('#wr-on', el).checked, day: Number($('#wr-day', el).value), hour: Number($('#wr-hour', el).value), notificationIds: $$('[data-wr]', el).filter((c) => c.checked).map((c) => Number(c.dataset.wr)) };
     return d;
