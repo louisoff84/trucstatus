@@ -5,7 +5,7 @@ let selectedId = null;
 let chartHours = 24;
 let chartBeats = [];
 
-const TYPE_LABEL = { http: 'HTTP(S)', keyword: 'HTTP(S) — Mot-clé', json: 'HTTP(S) — Requête JSON', tcp: 'Port TCP', ping: 'Ping', dns: 'DNS', push: 'Push (heartbeat)', minecraft: 'Serveur Minecraft', proxmox: 'Nœud Proxmox', database: 'Base de données' };
+const TYPE_LABEL = { http: 'HTTP(S)', keyword: 'HTTP(S) — Mot-clé', json: 'HTTP(S) — Requête JSON', tcp: 'Port TCP', ping: 'Ping', dns: 'DNS', push: 'Push (heartbeat)', minecraft: 'Serveur Minecraft', proxmox: 'Nœud Proxmox', database: 'Base de données', pterodactyl: 'Serveur Pterodactyl' };
 let chartMode = 'ping'; // 'ping' ou 'players' (Minecraft)
 let pages = [];
 
@@ -248,6 +248,9 @@ function renderDetail(full = true) {
       <div class="panel-head"><h3>Badge</h3></div>
       <p class="muted small" style="margin-top:0">À intégrer dans un README ou un site (monitor public uniquement) :</p>
       <input readonly value="${esc(location.origin)}/api/badge/${m.id}" onclick="this.select()">
+      <p class="muted small">Badges <a href="https://shields.io" target="_blank" rel="noopener">Shields.io</a> (statut, disponibilité 30 j, ping${m.type === 'minecraft' ? ', joueurs' : ''}) :</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">${['status', 'uptime&window=30d', 'ping', ...(m.type === 'minecraft' ? ['players'] : [])].map((k) => `<img alt="" src="https://img.shields.io/endpoint?url=${encodeURIComponent(location.origin + '/api/shields/' + m.id + '?metric=' + k)}">`).join('')}</div>
+      <input readonly value="https://img.shields.io/endpoint?url=${esc(encodeURIComponent(location.origin + '/api/shields/' + m.id + '?metric=status'))}" onclick="this.select()">
     </div>
     ${m.type === 'push' ? `<div class="card panel">
       <div class="panel-head"><h3>URL de push</h3></div>
@@ -298,6 +301,15 @@ function extraStatsHTML(m) {
   if (x.kind === 'minecraft') return `
     <div class="card stat"><div class="k">Joueurs</div><div class="v">${x.online}<small> / ${x.max}</small></div></div>
     <div class="card stat"><div class="k">Version</div><div class="v" style="font-size:16px">${esc(x.version || '—')}</div></div>`;
+  if (x.kind === 'pterodactyl') {
+    const memPct = x.memLimitMb ? Math.round((x.memMb / x.memLimitMb) * 100) : null;
+    return `
+    <div class="card stat"><div class="k">État (panel)</div><div class="v" style="font-size:18px">${esc({ running: '▶ En marche', offline: '⏹ Arrêté', starting: '⏳ Démarrage', stopping: '⏳ Arrêt' }[x.state] || x.state)}</div><div class="muted small">${esc(x.name || '')}</div></div>
+    <div class="card stat"><div class="k">CPU</div><div class="v">${x.cpu}<small> %${x.cpuLimit ? ' / ' + x.cpuLimit : ''}</small></div></div>
+    <div class="card stat"><div class="k">RAM</div><div class="v" style="font-size:18px">${x.memMb}<small> Mo${x.memLimitMb ? ' / ' + x.memLimitMb : ''}</small></div>${memPct != null ? `<div class="meter"><span class="${m.config.pteroMem && memPct > m.config.pteroMem ? 'warn' : ''}" style="width:${Math.min(100, memPct)}%"></span></div>` : ''}</div>
+    <div class="card stat"><div class="k">Disque</div><div class="v" style="font-size:18px">${x.diskMb}<small> Mo${x.diskLimitMb ? ' / ' + x.diskLimitMb : ''}</small></div></div>
+    <div class="card stat"><div class="k">Uptime</div><div class="v" style="font-size:18px">${x.uptime ? fmtUptime(x.uptime) : '—'}</div></div>`;
+  }
   if (x.kind === 'database') return `
     <div class="card stat"><div class="k">Moteur</div><div class="v" style="font-size:16px">${esc({ mysql: 'MySQL / MariaDB', postgres: 'PostgreSQL', redis: 'Redis' }[x.engine] || x.engine)}</div><div class="muted small">${esc(x.version || (x.ssl != null ? (x.ssl ? 'SSL disponible' : 'SSL non activé') : ''))}</div></div>`;
   if (x.kind === 'proxmox') return `
@@ -480,6 +492,17 @@ function openMonitorForm(cfg = {}) {
         </div>
         <p class="muted small" style="margin-top:-6px">MySQL/PostgreSQL : vérifie que le serveur répond à son protocole (aucun identifiant nécessaire). Redis : envoie PING (et AUTH si un mot de passe est saisi).</p>
       </div>
+      <fieldset class="t-ptero"><legend>Pterodactyl</legend>
+        <div class="row">
+          <div class="field"><label>Identifiant du serveur</label><input name="pteroServerId" value="${esc(c.pteroServerId || '')}" placeholder="1a2b3c4d (dans l’URL du serveur)"></div>
+          <div class="field"><label>Clé API client (ptlc_…)</label><input type="password" name="pteroApiKey" value="" autocomplete="new-password" placeholder="${c.secretsSet && c.secretsSet.pteroApiKey ? '•••••••• (inchangée)' : 'ptlc_…'}"></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Seuil RAM (% de la limite)</label><input type="number" name="pteroMem" min="0" max="100" value="${c.pteroMem || ''}" placeholder="90"></div>
+          <div class="field"><label>Seuil CPU (% de la limite)</label><input type="number" name="pteroCpu" min="0" max="100" value="${c.pteroCpu || ''}" placeholder="95"></div>
+        </div>
+        <p class="muted small" style="margin-top:-6px">Clé à créer dans le panel : <i>Compte → Identifiants API</i>. Serveur arrêté = hors ligne ; démarrage ou seuil dépassé = dégradé.</p>
+      </fieldset>
       <fieldset class="t-pve"><legend>Proxmox VE</legend>
         <div class="row">
           <div class="field"><label>Nom du nœud</label><input name="pveNode" value="${esc(c.pveNode || '')}" placeholder="pve"></div>
@@ -567,16 +590,17 @@ function openMonitorForm(cfg = {}) {
     const t = form.type.value;
     const http = ['http', 'keyword', 'json'].includes(t);
     $$('.t-http', form).forEach((x) => x.classList.toggle('hidden', !http));
-    $$('.t-url', form).forEach((x) => x.classList.toggle('hidden', !http && t !== 'proxmox'));
-    $$('.t-tls', form).forEach((x) => x.classList.toggle('hidden', !http && t !== 'proxmox'));
-    $$('.t-host', form).forEach((x) => x.classList.toggle('hidden', http || t === 'push' || t === 'proxmox'));
+    $$('.t-url', form).forEach((x) => x.classList.toggle('hidden', !http && t !== 'proxmox' && t !== 'pterodactyl'));
+    $$('.t-tls', form).forEach((x) => x.classList.toggle('hidden', !http && t !== 'proxmox' && t !== 'pterodactyl'));
+    $$('.t-ptero', form).forEach((x) => x.classList.toggle('hidden', t !== 'pterodactyl'));
+    $$('.t-host', form).forEach((x) => x.classList.toggle('hidden', http || t === 'push' || t === 'proxmox' || t === 'pterodactyl'));
     $$('.t-port', form).forEach((x) => x.classList.toggle('hidden', t !== 'tcp' && t !== 'minecraft' && t !== 'database'));
     $$('.t-db', form).forEach((x) => x.classList.toggle('hidden', t !== 'database'));
     $$('.t-redis', form).forEach((x) => x.classList.toggle('hidden', form.dbKind.value !== 'redis'));
     $$('.t-mc', form).forEach((x) => x.classList.toggle('hidden', t !== 'minecraft'));
     $$('.t-pve', form).forEach((x) => x.classList.toggle('hidden', t !== 'proxmox'));
-    $('#lbl-url', el).textContent = t === 'proxmox' ? 'URL de l’API Proxmox' : 'URL';
-    form.url.placeholder = t === 'proxmox' ? 'https://192.168.1.10:8006' : 'https://craftpick.fr';
+    $('#lbl-url', el).textContent = t === 'proxmox' ? 'URL de l’API Proxmox' : t === 'pterodactyl' ? 'URL du panel Pterodactyl' : 'URL';
+    form.url.placeholder = t === 'proxmox' ? 'https://192.168.1.10:8006' : t === 'pterodactyl' ? 'https://panel.craftpick.fr' : 'https://craftpick.fr';
     form.port.placeholder = t === 'minecraft' ? (form.mcEdition.value === 'bedrock' ? '19132' : '25565 (ou SRV)') : t === 'database' ? { mysql: '3306', postgres: '5432', redis: '6379' }[form.dbKind.value] : '443';
     if (t === 'proxmox' && !isEdit && !form.dataset.tlsSet) { form.ignoreTls.checked = true; form.dataset.tlsSet = '1'; }
     $$('.t-push', form).forEach((x) => x.classList.toggle('hidden', t !== 'push'));
@@ -928,6 +952,20 @@ async function openSettings() {
           <span class="small ${dl.lastError ? '' : 'muted'}" style="${dl.lastError ? 'color:var(--down)' : ''}">${dl.lastError ? '⚠ ' + esc(dl.lastError) : dl.messageId ? '✓ Message actif' : ''}</span></div>
       </fieldset>
 
+      <fieldset><legend>🤖 Commande Discord /status</legend>
+        <p class="muted small" style="margin-top:0">Dans le <a href="https://discord.com/developers/applications" target="_blank" rel="noopener">portail développeur Discord</a> : crée une application, copie l’<b>ID d’application</b> et la <b>clé publique</b> (General Information), le <b>token du bot</b> (Bot), puis colle l’URL ci-dessous dans « Interactions Endpoint URL ». Invite l’app avec le scope <code>applications.commands</code>.</p>
+        <div class="row">
+          <div class="field"><label>ID d’application</label><input id="bot-app" value="${esc(s.discordBot.applicationId)}" placeholder="123456789012345678"></div>
+          <div class="field"><label>Clé publique</label><input id="bot-key" value="${esc(s.discordBot.publicKey)}" placeholder="64 caractères hexadécimaux"></div>
+        </div>
+        <div class="row">
+          <div class="field"><label>Token du bot (pour enregistrer la commande)</label><input type="password" id="bot-token" autocomplete="new-password" placeholder="${s.discordBot.botTokenSet ? '•••••••• (inchangé)' : 'MTIz…'}"></div>
+          <div class="field"><label>Services affichés</label><select id="bot-page">${pageOpts(s.discordBot.page)}</select></div>
+        </div>
+        <div class="field"><label>Interactions Endpoint URL</label><input readonly onclick="this.select()" value="${esc((s.publicUrl || location.origin).replace(/\/+$/, ''))}/api/discord/interactions"></div>
+        <div class="actions" style="margin-bottom:12px"><button type="button" class="btn sm" id="bot-reg">Enregistrer la commande /status</button></div>
+      </fieldset>
+
       <fieldset><legend>📊 Rapport hebdomadaire</legend>
         <label class="check"><input type="checkbox" id="wr-on" ${wr.enabled ? 'checked' : ''}> Envoyer automatiquement un rapport de disponibilité chaque semaine</label>
         <div class="row">
@@ -960,6 +998,7 @@ async function openSettings() {
           <a class="btn" href="/api/export">⬇ Exporter la configuration</a>
           <label class="btn" style="margin:0;color:var(--text)">⬆ Importer<input type="file" accept=".json" id="imp" hidden></label>
           <button type="button" class="btn" id="bk-now">💾 Sauvegarder maintenant</button>
+          <label class="btn" style="margin:0;color:var(--text)">🐻 Importer depuis Uptime Kuma<input type="file" accept=".json" id="imp-kuma" hidden></label>
         </div>
         <p class="muted small" style="margin-top:0">Sauvegarde automatique chaque jour dans <code>data/backups/</code> (14 dernières conservées).</p>
         <div id="bk-list" style="margin-bottom:12px"></div>
@@ -991,6 +1030,7 @@ async function openSettings() {
     d.accentColor = $('#ac-on', el).checked ? $('#ac-color', el).value : '';
     d.banner = { text: $('#bn-text', el).value, level: $('#bn-level', el).value, link: $('#bn-link', el).value.trim() };
     d.customCss = $('#css', el).value;
+    d.discordBot = { applicationId: $('#bot-app', el).value.trim(), publicKey: $('#bot-key', el).value.trim(), botToken: $('#bot-token', el).value.trim(), page: $('#bot-page', el).value };
     d.discordLive = { enabled: $('#dl-on', el).checked, webhookUrl: $('#dl-url', el).value.trim(), page: $('#dl-page', el).value, username: $('#dl-name', el).value };
     d.weeklyReport = { enabled: $('#wr-on', el).checked, day: Number($('#wr-day', el).value), hour: Number($('#wr-hour', el).value), notificationIds: $$('[data-wr]', el).filter((c) => c.checked).map((c) => Number(c.dataset.wr)) };
     return d;
@@ -1013,6 +1053,22 @@ async function openSettings() {
       await api('/api/settings', { method: 'PUT', body: collect() });
       const r = await api('/api/report/send', { method: 'POST' });
       r.errors.length ? toast('Erreurs : ' + r.errors.join(' ; '), true) : toast(`Rapport envoyé (${r.sent}) ✓`);
+    } catch (err) { toast(err.message, true); }
+  };
+  $('#imp-kuma', el).onchange = async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    try {
+      const r = await api('/api/import/kuma', { method: 'POST', body: JSON.parse(await f.text()) });
+      toast(`Uptime Kuma : ${r.monitors} monitor(s) et ${r.notifications} notification(s) importés${r.skipped.length ? ` · ${r.skipped.length} ignoré(s)` : ''}`);
+      if (r.skipped.length) alert('Éléments non importés :\n\n' + r.skipped.join('\n'));
+      await Promise.all([loadMonitors(), loadNotifications()]);
+    } catch (err) { toast(err.message, true); }
+  };
+  $('#bot-reg', el).onclick = async () => {
+    try {
+      await api('/api/settings', { method: 'PUT', body: collect() });
+      const r = await api('/api/discord/register', { method: 'POST' });
+      r.ok ? toast('Commande /status enregistrée sur Discord ✓') : toast(r.error, true);
     } catch (err) { toast(err.message, true); }
   };
   $('#imp', el).onchange = async (e) => {

@@ -40,6 +40,7 @@ Les données sont stockées dans `./data`, monté comme volume.
 - **Push / heartbeat** : ton script ou ton cron appelle une URL ; s'il ne le fait plus dans le délai prévu, le monitor passe hors ligne
 - **Serveur Minecraft** (Java et Bedrock) : joueurs connectés, version, MOTD, courbe de fréquentation ; SRV `_minecraft._tcp` pris en charge
 - **Bases de données** : MySQL/MariaDB (version via le handshake), PostgreSQL (SSLRequest), Redis (AUTH + PING + version) — sans identifiants pour MySQL/PostgreSQL
+- **Serveur Pterodactyl** via l'API client du panel : état, CPU, RAM, disque, uptime (arrêté = hors ligne, démarrage/seuil = dégradé)
 - **Nœud Proxmox VE** via l'API : CPU, RAM, disque, uptime, VM/CT ; panne si une VM surveillée s'arrête, « Dégradé » si un seuil est dépassé
 - **Statut « Dégradé »** : le service répond, mais au-delà d'un seuil de temps de réponse (orange, compté comme disponible, notification optionnelle)
 - Tentatives avant alerte, intervalle accéléré en cas de panne, **rappels réguliers tant que le service reste en panne**
@@ -154,6 +155,8 @@ Le générateur de code se trouve dans *Paramètres*. Les pages protégées par 
 | `GET /api/feed.xml` | Flux RSS des incidents |
 | `GET /api/badge/<id>` | Badge SVG |
 | `GET /embed` | Widget HTML intégrable |
+| `GET /api/shields/<id>` | Badge Shields.io (endpoint JSON) |
+| `POST /api/discord/interactions` | Commande Discord /status (signée Ed25519) |
 | `GET /api/service/<id>` | Détail public d'un service (`?hours=24|168`, `?page=<slug>`) |
 | `GET/POST /api/push/<token>` | Réception d'un heartbeat |
 
@@ -188,6 +191,69 @@ curl -X POST -H "Authorization: Bearer cs_xxx" -H "Content-Type: application/jso
 curl -X POST -H "Authorization: Bearer cs_xxx" -H "Content-Type: application/json" -d '{"minutes":60}' \
   https://status.craftpick.fr/api/monitors/12/snooze
 ```
+
+## Intégrations
+
+### Grafana / Prometheus
+
+Crée une clé API (rôle lecteur), puis dans `prometheus.yml` :
+
+```yaml
+scrape_configs:
+  - job_name: craftpick-status
+    scheme: https
+    metrics_path: /api/metrics
+    authorization:
+      credentials: cs_xxx   # clé API
+    static_configs:
+      - targets: ['status.craftpick.fr']
+```
+
+Métriques exposées :
+- `craftpick_monitor_up`, `craftpick_monitor_status`, `craftpick_monitor_response_ms` ;
+- `craftpick_monitor_uptime_ratio{window="24h|7d|30d"}`, `craftpick_monitor_cert_days_left` ;
+- `craftpick_minecraft_players_online` et `craftpick_minecraft_players_max` ;
+- `craftpick_proxmox_{cpu,memory,disk}_ratio`, `craftpick_pterodactyl_{cpu_percent,memory_bytes}` ;
+- `craftpick_incidents_open`.
+
+### Commande Discord `/status`
+
+Aucun bot à héberger : Discord appelle directement ta page de status.
+
+1. Sur [discord.com/developers/applications](https://discord.com/developers/applications), crée une application.
+2. Copie l'**ID d'application** et la **clé publique**, ainsi que le **token** de l'onglet Bot, dans *Paramètres → Commande Discord /status*.
+3. Colle l'URL `https://status.craftpick.fr/api/discord/interactions` dans *Interactions Endpoint URL*.
+4. Clique sur « Enregistrer la commande /status » puis invite l'application avec le scope `applications.commands`.
+
+`/status` affiche tous les services. `/status service:Survie` affiche le détail d'un service, avec autocomplétion des noms.
+
+### Pterodactyl
+
+Type « Serveur Pterodactyl » :
+- URL du panel ;
+- identifiant court du serveur (visible dans l'URL `/server/1a2b3c4d`) ;
+- clé API client `ptlc_…`, à créer dans *Compte → Identifiants API*.
+
+### Badges Shields.io
+
+```markdown
+![Survie](https://img.shields.io/endpoint?url=https://status.craftpick.fr/api/shields/12?metric=status)
+![Uptime](https://img.shields.io/endpoint?url=https://status.craftpick.fr/api/shields/12?metric=uptime%26window=30d)
+![Joueurs](https://img.shields.io/endpoint?url=https://status.craftpick.fr/api/shields/12?metric=players)
+```
+
+Métriques : `status`, `uptime` (`window=24h|7d|30d`), `ping`, `players`. Seuls les monitors publics sont concernés. Les liens prêts à copier sont dans la fiche de chaque monitor.
+
+### Migration depuis Uptime Kuma
+
+Dans Kuma, *Paramètres → Sauvegarde → Exporter* (JSON). Ensuite, ici : *Paramètres → Sauvegarde → Importer depuis Uptime Kuma*.
+
+Types repris :
+- HTTP, mot-clé, requête JSON, port, ping, DNS, push ;
+- Minecraft (via GameDig) ;
+- MySQL, PostgreSQL et Redis.
+
+Les groupes Kuma deviennent des groupes, et les notifications sont reprises : Discord, Slack, Telegram, webhook, ntfy, Gotify, Pushover, SMTP. Ce qui ne peut pas être converti est listé à la fin de l'import.
 
 ## Notifications email
 

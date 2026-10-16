@@ -9,6 +9,8 @@ const notify = require('./lib/notify');
 const schedule = require('./lib/schedule');
 const discordLive = require('./lib/discordLive');
 const report = require('./lib/report');
+const discordBot = require('./lib/discordBot');
+const kuma = require('./lib/kuma');
 
 const PORT = Number(process.env.PORT) || 3001;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -120,10 +122,10 @@ function send(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   res.end(body);
 }
-function readBody(req) {
+function readBody(req, max = 1e6) {
   return new Promise((resolve, reject) => {
     let raw = '';
-    req.on('data', (c) => { raw += c; if (raw.length > 1e6) { reject(new Error('Corps trop volumineux')); req.destroy(); } });
+    req.on('data', (c) => { raw += c; if (raw.length > max) { reject(new Error('Corps trop volumineux')); req.destroy(); } });
     req.on('end', () => { if (!raw) return resolve({}); try { resolve(JSON.parse(raw)); } catch { reject(new Error('JSON invalide')); } });
     req.on('error', reject);
   });
@@ -131,9 +133,9 @@ function readBody(req) {
 const clamp = (v, min, max, def) => { if (v == null || v === '') return def; const n = Number(v); return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def; };
 const str = (v, max = 500) => (v == null ? '' : String(v).slice(0, max));
 
-const MONITOR_TYPES = ['http', 'keyword', 'json', 'tcp', 'ping', 'dns', 'push', 'minecraft', 'proxmox', 'database'];
+const MONITOR_TYPES = ['http', 'keyword', 'json', 'tcp', 'ping', 'dns', 'push', 'minecraft', 'proxmox', 'database', 'pterodactyl'];
 // Champs secrets : jamais renvoyés au navigateur ; laissés vides dans le formulaire = valeur conservée
-const SECRET_FIELDS = ['basicAuthPass', 'pveTokenSecret', 'dbPassword'];
+const SECRET_FIELDS = ['basicAuthPass', 'pveTokenSecret', 'dbPassword', 'pteroApiKey'];
 function sanitizeMonitor(b, existing = {}) {
   b = { ...b };
   for (const f of SECRET_FIELDS) if (!b[f] && existing[f]) b[f] = existing[f];
@@ -184,6 +186,11 @@ function sanitizeMonitor(b, existing = {}) {
     dbKind: ['mysql', 'postgres', 'redis'].includes(b.dbKind) ? b.dbKind : 'mysql',
     dbUser: str(b.dbUser, 100),
     dbPassword: str(b.dbPassword, 200),
+    // Pterodactyl
+    pteroServerId: str(b.pteroServerId, 64).trim(),
+    pteroApiKey: str(b.pteroApiKey, 200).trim(),
+    pteroCpu: clamp(b.pteroCpu, 0, 100, 0),
+    pteroMem: clamp(b.pteroMem, 0, 100, 0),
     // Proxmox
     pveNode: str(b.pveNode, 100),
     pveTokenId: str(b.pveTokenId, 200),
@@ -193,7 +200,7 @@ function sanitizeMonitor(b, existing = {}) {
     pveMem: clamp(b.pveMem, 0, 100, 0),
     pveDisk: clamp(b.pveDisk, 0, 100, 0),
   };
-  if (['http', 'keyword', 'json', 'proxmox'].includes(m.type) && !/^https?:\/\//i.test(m.url)) throw new Error("L'URL doit commencer par http:// ou https://");
+  if (['http', 'keyword', 'json', 'proxmox', 'pterodactyl'].includes(m.type) && !/^https?:\/\//i.test(m.url)) throw new Error("L'URL doit commencer par http:// ou https://");
   if (['tcp', 'ping', 'dns', 'minecraft', 'database'].includes(m.type) && !m.hostname) throw new Error('Nom d’hôte requis');
   if (m.parentId) {
     if (!db.data.monitors.some((x) => x.id === m.parentId)) m.parentId = null;
@@ -207,6 +214,7 @@ function sanitizeMonitor(b, existing = {}) {
       }
     }
   }
+  if (m.type === 'pterodactyl' && (!/^[\w-]{4,64}$/.test(m.pteroServerId) || !m.pteroApiKey)) throw new Error('Identifiant du serveur et clé API client Pterodactyl requis');
   if (m.type === 'proxmox' && (!m.pveNode || !m.pveTokenId || !m.pveTokenSecret)) throw new Error('Nœud, ID du jeton et secret Proxmox requis');
   if (m.type === 'proxmox' && !/^[^@\s]+@[^!\s]+![^\s=]+$/.test(m.pveTokenId)) throw new Error('ID du jeton au format utilisateur@realm!nom (ex. root@pam!status)');
   if (m.type === 'tcp' && !m.port) throw new Error('Port requis');
@@ -256,6 +264,7 @@ function target(m) {
   if (['http', 'keyword', 'json'].includes(m.type)) return m.url;
   if (m.type === 'push') return 'Push (heartbeat)';
   if (m.type === 'proxmox') return `${m.url} · nœud ${m.pveNode}`;
+  if (m.type === 'pterodactyl') return `${m.url} · serveur ${m.pteroServerId}`;
   if (m.type === 'database') return `${{ mysql: 'MySQL', postgres: 'PostgreSQL', redis: 'Redis' }[m.dbKind]} · ${m.hostname}${m.port ? ':' + m.port : ''}`;
   if (m.type === 'minecraft') return m.hostname + (m.port ? ':' + m.port : '') + (m.mcEdition === 'bedrock' ? ' (Bedrock)' : '');
   return m.hostname + (m.port && m.type === 'tcp' ? ':' + m.port : '');
@@ -386,7 +395,7 @@ setInterval(() => { for (const c of clients) c.res.write(': ping\n\n'); }, 25000
 // ───────────────────────── Routeur ─────────────────────────
 // Rôle requis : route explicite, sinon admin pour les zones sensibles, éditeur pour les modifications, lecteur pour la lecture
 const ROLE_LABEL = { viewer: 'lecteur', editor: 'éditeur', admin: 'administrateur' };
-const ADMIN_ONLY = [/^\/api\/settings/, /^\/api\/notifications/, /^\/api\/backups/, /^\/api\/export/, /^\/api\/import/, /^\/api\/users/, /^\/api\/apikeys/, /^\/api\/audit/, /^\/api\/discord-live/, /^\/api\/report/, /^\/api\/pages/];
+const ADMIN_ONLY = [/^\/api\/settings/, /^\/api\/notifications/, /^\/api\/backups/, /^\/api\/export/, /^\/api\/import/, /^\/api\/users/, /^\/api\/apikeys/, /^\/api\/audit/, /^\/api\/discord-live/, /^\/api\/discord\/register/, /^\/api\/report/, /^\/api\/pages/];
 function requiredRole(r, method, path) {
   if (typeof r.auth === 'string') return r.auth;
   if (ADMIN_ONLY.some((re) => re.test(path)) && !(method === 'GET' && path === '/api/notifications')) return 'admin';
@@ -415,6 +424,7 @@ const AUDIT_ACTIONS = [
   ['POST', /^\/api\/apikeys$/, 'Clé API créée', 'apiKeys'],
   ['DELETE', /^\/api\/apikeys\/\d+$/, 'Clé API révoquée', 'apiKeys'],
   ['POST', /^\/api\/import$/, 'Configuration importée', null],
+  ['POST', /^\/api\/import\/kuma$/, 'Import depuis Uptime Kuma', null],
   ['POST', /^\/api\/backups$/, 'Sauvegarde créée', null],
   ['POST', /^\/api\/report\/send$/, 'Rapport hebdomadaire envoyé', null],
 ];
@@ -498,6 +508,103 @@ route('GET', '/api/service/:id', (req, res, p, q) => {
     incidents: visibleIncidents(ids).filter((i) => (i.monitorIds || []).includes(id)).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 20),
   });
 });
+
+// ── Intégrations ──
+// Commande Discord /status : URL à coller dans « Interactions Endpoint URL » du portail développeur
+route('POST', '/api/discord/interactions', async (req, res) => {
+  const cfg = db.data.settings.discordBot || {};
+  const raw = await new Promise((resolve, reject) => { let r = ''; req.on('data', (c) => { r += c; if (r.length > 1e5) req.destroy(); }); req.on('end', () => resolve(r)); req.on('error', reject); });
+  if (!cfg.publicKey || !discordBot.verify(cfg.publicKey, req.headers['x-signature-ed25519'], req.headers['x-signature-timestamp'], raw)) return send(res, 401, { error: 'Signature invalide' });
+  let body; try { body = JSON.parse(raw); } catch { return send(res, 400, { error: 'JSON invalide' }); }
+  const page = cfg.page ? findPage(cfg.page) : null;
+  send(res, 200, discordBot.handleInteraction(body, buildStatus(page)));
+});
+route('POST', '/api/discord/register', async (req, res) => {
+  const cfg = db.data.settings.discordBot || {};
+  if (!cfg.applicationId || !cfg.botToken) return send(res, 400, { error: 'Renseigne l’ID d’application et le token du bot, puis enregistre' });
+  try { await discordBot.registerCommand(cfg.applicationId, cfg.botToken); send(res, 200, { ok: true }); }
+  catch (e) { send(res, 200, { ok: false, error: e.message }); }
+}, true);
+
+// Badge Shields.io : https://img.shields.io/endpoint?url=<site>/api/shields/<id>?metric=status|uptime|ping|players
+route('GET', '/api/shields/:id', (req, res, p, q) => {
+  const m = db.data.monitors.find((x) => x.id === Number(p.id) && x.isPublic);
+  if (!m) return send(res, 404, { schemaVersion: 1, label: 'status', message: 'introuvable', color: 'lightgrey', isError: true });
+  const metric = q.get('metric') || 'status';
+  const sm = monitorSummary(m, false);
+  const s = sm.status;
+  const color = s === 1 ? 'brightgreen' : s === 4 ? 'orange' : s === 0 ? 'red' : s === 3 ? 'blue' : 'lightgrey';
+  let out;
+  if (metric === 'uptime') {
+    const win = q.get('window') === '30d' ? '30d' : q.get('window') === '7d' ? '7d' : '24h';
+    const v = { '24h': sm.uptime24, '7d': sm.uptime7, '30d': sm.uptime30 }[win];
+    out = { label: `uptime ${win}`, message: v == null ? 'n/a' : v.toFixed(2) + '%', color: v == null ? 'lightgrey' : v >= 99.9 ? 'brightgreen' : v >= 99 ? 'green' : v >= 95 ? 'yellow' : 'red' };
+  } else if (metric === 'ping') out = { label: 'ping', message: sm.ping != null ? sm.ping + ' ms' : 'n/a', color: sm.ping == null ? 'lightgrey' : sm.ping < 200 ? 'brightgreen' : sm.ping < 800 ? 'yellow' : 'orange' };
+  else if (metric === 'players') out = { label: 'joueurs', message: sm.mc ? `${sm.mc.online}/${sm.mc.max}` : 'hors ligne', color: sm.mc ? 'blue' : 'lightgrey' };
+  else out = { label: q.get('label') || m.name.slice(0, 30), message: { 1: 'en ligne', 4: 'dégradé', 0: 'hors ligne', 3: 'maintenance', 2: 'vérification', '-1': 'en pause' }[s], color };
+  res.setHeader('Cache-Control', 'max-age=60');
+  send(res, 200, { schemaVersion: 1, ...out });
+});
+
+// Métriques Prometheus (scrape avec une clé API : bearer_token)
+route('GET', '/api/metrics', (req, res) => {
+  const lbl = (v) => String(v ?? '').replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, ' ');
+  const lines = [];
+  const def = (name, help, type = 'gauge') => lines.push(`# HELP ${name} ${help}`, `# TYPE ${name} ${type}`);
+  const metrics = {
+    craftpick_monitor_up: ['1 si le service répond (en ligne ou dégradé)', []],
+    craftpick_monitor_status: ['Statut : 0 hors ligne, 1 en ligne, 2 en attente, 3 maintenance, 4 dégradé, -1 en pause', []],
+    craftpick_monitor_response_ms: ['Dernier temps de réponse en millisecondes', []],
+    craftpick_monitor_uptime_ratio: ['Disponibilité (0 à 1) par fenêtre', []],
+    craftpick_monitor_cert_days_left: ['Jours avant expiration du certificat TLS', []],
+    craftpick_minecraft_players_online: ['Joueurs Minecraft connectés', []],
+    craftpick_minecraft_players_max: ['Places Minecraft', []],
+    craftpick_proxmox_cpu_ratio: ['CPU du nœud Proxmox (0 à 1)', []],
+    craftpick_proxmox_memory_ratio: ['RAM du nœud Proxmox (0 à 1)', []],
+    craftpick_proxmox_disk_ratio: ['Disque du nœud Proxmox (0 à 1)', []],
+    craftpick_pterodactyl_memory_bytes: ['RAM utilisée par le serveur Pterodactyl', []],
+    craftpick_pterodactyl_cpu_percent: ['CPU du serveur Pterodactyl (%)', []],
+  };
+  const add = (k, labels, v) => { if (v != null && Number.isFinite(Number(v))) metrics[k][1].push(`${k}{${labels}} ${Number(v)}`); };
+  for (const m of db.data.monitors) {
+    const sm = monitorSummary(m, true);
+    const L = `id="${m.id}",name="${lbl(m.name)}",type="${m.type}",group="${lbl(m.group)}"`;
+    add('craftpick_monitor_up', L, sm.status === 1 || sm.status === 4 ? 1 : 0);
+    add('craftpick_monitor_status', L, sm.status);
+    add('craftpick_monitor_response_ms', L, sm.ping);
+    for (const [w, v] of [['24h', sm.uptime24], ['7d', sm.uptime7], ['30d', sm.uptime30]]) if (v != null) add('craftpick_monitor_uptime_ratio', `${L},window="${w}"`, (v / 100).toFixed(5));
+    if (sm.cert) add('craftpick_monitor_cert_days_left', L, sm.cert.daysLeft);
+    const x = sm.extra;
+    if (x && x.kind === 'minecraft' && (sm.status === 1 || sm.status === 4)) { add('craftpick_minecraft_players_online', L, x.online); add('craftpick_minecraft_players_max', L, x.max); }
+    if (x && x.kind === 'proxmox') { add('craftpick_proxmox_cpu_ratio', L, x.cpu / 100); add('craftpick_proxmox_memory_ratio', L, x.mem / 100); add('craftpick_proxmox_disk_ratio', L, x.disk / 100); }
+    if (x && x.kind === 'pterodactyl') { add('craftpick_pterodactyl_memory_bytes', L, x.memMb * 1048576); add('craftpick_pterodactyl_cpu_percent', L, x.cpu); }
+  }
+  for (const [k, [help, rows]] of Object.entries(metrics)) if (rows.length) { def(k, help); lines.push(...rows); }
+  def('craftpick_incidents_open', 'Incidents ouverts (hors maintenances)');
+  lines.push(`craftpick_incidents_open ${db.data.incidents.filter((i) => i.status !== 'resolved' && i.severity !== 'maintenance').length}`);
+  res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
+  res.end(lines.join('\n') + '\n');
+}, true);
+
+// Import d'une sauvegarde Uptime Kuma
+route('POST', '/api/import/kuma', async (req, res) => {
+  const { monitors, notifications, skipped } = kuma.convert(await readBody(req, 20e6));
+  const notifMap = {};
+  for (const n of notifications) { const nn = sanitizeNotif(n); nn.id = db.nextId(); notifMap[n._kumaId] = nn.id; db.data.notifications.push(nn); }
+  const monMap = {};
+  let count = 0;
+  for (const raw of monitors) {
+    try {
+      const m = sanitizeMonitor({ ...raw, parentId: null, notificationIds: raw._kumaNotifs.map((x) => notifMap[x]).filter(Boolean) });
+      for (const k of Object.keys(m)) if (k.startsWith('_kuma')) delete m[k];
+      m.id = db.nextId(); m.createdAt = new Date().toISOString();
+      monMap[raw._kumaId] = m.id;
+      db.data.monitors.push(m); monitor.start(m); count++;
+    } catch (e) { skipped.push(`« ${raw.name} » : ${e.message}`); }
+  }
+  db.save();
+  send(res, 200, { ok: true, monitors: count, notifications: notifications.length, skipped });
+}, true);
 
 // Déverrouillage d'une page protégée par mot de passe
 route('POST', '/api/pages/:slug/unlock', async (req, res, p) => {
@@ -872,11 +979,12 @@ route('DELETE', '/api/pages/:id', (req, res, prm) => {
 
 // Paramètres (admin)
 route('GET', '/api/settings', (req, res) => {
-  const { title, description, logoUrl, footer, publicUrl, discordLive: dl, weeklyReport: wr, accentColor, banner, customCss } = db.data.settings;
+  const { title, description, logoUrl, footer, publicUrl, discordLive: dl, weeklyReport: wr, accentColor, banner, customCss, discordBot: dbot } = db.data.settings;
   send(res, 200, {
     title, description, logoUrl: logoUrl || '', footer: footer || '', publicUrl: publicUrl || '',
     accentColor: accentColor || '', banner: { text: '', level: 'info', link: '', ...(banner || {}) }, customCss: customCss || '',
     backups: db.listBackups(),
+    discordBot: { applicationId: (dbot && dbot.applicationId) || '', publicKey: (dbot && dbot.publicKey) || '', page: (dbot && dbot.page) || '', botTokenSet: !!(dbot && dbot.botToken) },
     discordLive: { enabled: false, webhookUrl: '', page: '', username: '', ...(dl || {}) },
     weeklyReport: { enabled: false, day: 1, hour: 9, notificationIds: [], ...(wr || {}) },
     pages: db.data.pages.map((pg) => ({ slug: pg.slug, title: pg.title, protected: !!pg.passwordHash })),
@@ -912,6 +1020,12 @@ route('PUT', '/api/settings', async (req, res) => {
       lastError: prev.lastError || null,
     };
     discordLive.schedule(1000);
+  }
+  if (b.discordBot) {
+    const d = b.discordBot, prev = s.discordBot || {};
+    if (d.publicKey && !/^[0-9a-f]{64}$/i.test(d.publicKey.trim())) return send(res, 400, { error: 'Clé publique Discord invalide (64 caractères hexadécimaux)' });
+    if (d.page && !findPage(d.page)) return send(res, 400, { error: 'Page inconnue' });
+    s.discordBot = { applicationId: str(d.applicationId, 30).trim(), publicKey: str(d.publicKey, 64).trim().toLowerCase(), page: str(d.page, 40), botToken: str(d.botToken, 200).trim() || prev.botToken || '' };
   }
   if (b.weeklyReport) {
     const w = b.weeklyReport;

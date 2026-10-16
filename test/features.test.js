@@ -15,6 +15,8 @@ const { applyDegraded } = require('../lib/monitor');
 const { inRecurringWindow, maintenanceActive, describeRecurrence } = require('../lib/schedule');
 const { checkDatabase } = require('../lib/database');
 const { sendMail } = require('../lib/smtp');
+const { checkPterodactyl } = require('../lib/pterodactyl');
+const crypto = require('node:crypto');
 
 const servers = [];
 let proc, base, cookie = '';
@@ -526,4 +528,104 @@ test('export CSV de l’historique', async () => {
   const lines = txt.replace(/^\ufeff/, '').split('\r\n');
   assert.strictEqual(lines[0], 'date;statut;ping_ms;joueurs;message');
   assert.ok(lines.some((l) => l.includes(';Hors ligne;')));
+});
+
+// ───────── v1.6 : intégrations ─────────
+test('Pterodactyl : en marche, démarrage, arrêté, clé refusée', async () => {
+  let state = 'running';
+  const srv = http.createServer((req, res) => {
+    if (req.headers.authorization !== 'Bearer ptlc_ok') { res.writeHead(401); return res.end('{}'); }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    if (req.url === '/api/client/servers/abcd1234/resources') return res.end(JSON.stringify({ attributes: { current_state: state, is_suspended: false, resources: { memory_bytes: 3 * 1048576 * 1024, cpu_absolute: 87.5, disk_bytes: 5e9, uptime: 3600000 } } }));
+    if (req.url === '/api/client/servers/abcd1234') return res.end(JSON.stringify({ attributes: { name: 'Survie', limits: { memory: 4096, cpu: 200, disk: 20000 } } }));
+    res.writeHead(404); res.end('{}');
+  });
+  servers.push(srv);
+  const port = await listen(srv);
+  const m = { url: `http://127.0.0.1:${port}`, pteroServerId: 'abcd1234', pteroApiKey: 'ptlc_ok', timeout: 5 };
+  const ok = await checkPterodactyl(m);
+  assert.strictEqual(ok.extra.memMb, 3072); assert.strictEqual(ok.extra.memLimitMb, 4096); assert.strictEqual(ok.extra.name, 'Survie');
+  assert.strictEqual(ok.degraded, null);
+  assert.match((await checkPterodactyl({ ...m, pteroMem: 70 })).degraded, /RAM 75 % > 70 %/);
+  state = 'starting'; assert.match((await checkPterodactyl(m)).degraded, /démarrage/);
+  state = 'offline'; await assert.rejects(checkPterodactyl(m), /arrêté/);
+  await assert.rejects(checkPterodactyl({ ...m, pteroApiKey: 'faux' }), /refusée/);
+});
+
+test('Discord /status : signature Ed25519, ping, commande, autocomplétion', async () => {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+  const pubHex = publicKey.export({ format: 'der', type: 'spki' }).slice(-32).toString('hex');
+  assert.strictEqual((await call('PUT', '/api/settings', { title: 'Craftpick Status', discordBot: { applicationId: '123', publicKey: pubHex, page: '' } })).status, 200);
+  const send = async (obj, sign = true) => {
+    const body = JSON.stringify(obj), ts = String(Math.floor(Date.now() / 1000));
+    const sig = crypto.sign(null, Buffer.from(ts + body), privateKey).toString('hex');
+    const r = await fetch(base + '/api/discord/interactions', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Signature-Ed25519': sign ? sig : '0'.repeat(128), 'X-Signature-Timestamp': ts }, body });
+    return { status: r.status, body: await r.json() };
+  };
+  assert.strictEqual((await send({ type: 1 }, false)).status, 401);
+  assert.deepStrictEqual((await send({ type: 1 })).body, { type: 1 });
+  const all = (await send({ type: 2, data: { name: 'status' } })).body;
+  assert.strictEqual(all.type, 4);
+  assert.ok(all.data.embeds[0].fields.length > 0);
+  const one = (await send({ type: 2, data: { name: 'status', options: [{ name: 'service', value: 'détail' }] } })).body;
+  assert.strictEqual(one.data.embeds[0].title, 'Détail');
+  const ac = (await send({ type: 4, data: { name: 'status', options: [{ name: 'service', value: 'dét', focused: true }] } })).body;
+  assert.strictEqual(ac.type, 8);
+  assert.ok(ac.data.choices.some((c) => c.name === 'Détail'));
+});
+
+test('Prometheus : métriques avec session ou clé API, refusé sinon', async () => {
+  const r = await fetch(base + '/api/metrics', { headers: { Cookie: cookie } });
+  const txt = await r.text();
+  assert.match(r.headers.get('content-type'), /text\/plain/);
+  assert.match(txt, /# TYPE craftpick_monitor_up gauge/);
+  assert.match(txt, /craftpick_monitor_up\{id="\d+",name="Détail",type="push",group=""\} 1/);
+  assert.match(txt, /craftpick_incidents_open \d+/);
+  assert.strictEqual((await fetch(base + '/api/metrics')).status, 401);
+  const k = (await call('POST', '/api/apikeys', { name: 'Prometheus', role: 'viewer' })).body;
+  assert.strictEqual((await fetch(base + '/api/metrics', { headers: { Authorization: 'Bearer ' + k.key } })).status, 200);
+});
+
+test('Shields.io : statut, disponibilité, monitor privé refusé', async () => {
+  const pub = (await call('GET', '/api/monitors')).body.find((x) => x.name === 'Détail');
+  const st = (await call('GET', `/api/shields/${pub.id}`, undefined, false)).body;
+  assert.strictEqual(st.schemaVersion, 1); assert.strictEqual(st.message, 'en ligne'); assert.strictEqual(st.color, 'brightgreen');
+  const up = (await call('GET', `/api/shields/${pub.id}?metric=uptime&window=30d`, undefined, false)).body;
+  assert.strictEqual(up.label, 'uptime 30d');
+  const priv = (await call('GET', '/api/monitors')).body.find((x) => x.name === 'Caché');
+  assert.strictEqual((await call('GET', `/api/shields/${priv.id}`, undefined, false)).status, 404);
+});
+
+test('import Uptime Kuma : monitors, groupes, notifications, éléments ignorés', async () => {
+  const backup = {
+    version: '1.23.13',
+    notificationList: [
+      { id: 1, name: 'Discord Kuma', active: 1, isDefault: 0, config: JSON.stringify({ type: 'discord', discordWebhookUrl: 'https://discord.com/api/webhooks/1/x' }) },
+      { id: 2, name: 'Matrix', active: 1, config: JSON.stringify({ type: 'matrix' }) },
+    ],
+    monitorList: [
+      { id: 10, name: 'Jeux', type: 'group' },
+      { id: 11, name: 'Kuma Site', type: 'http', url: 'https://craftpick.fr', method: 'GET', interval: 60, maxretries: 2, accepted_statuscodes: ['200-299'], parent: 10, notificationIDList: { 1: true }, active: 1 },
+      { id: 12, name: 'Kuma Mot-clé', type: 'keyword', url: 'https://craftpick.fr', keyword: 'Craftpick', interval: 120, active: 1 },
+      { id: 13, name: 'Kuma Port', type: 'port', hostname: '10.0.0.5', port: 25577, interval: 30, active: 1 },
+      { id: 14, name: 'Kuma MC', type: 'gamedig', game: 'minecraft', hostname: 'play.craftpick.fr', port: 25565, interval: 60, parent: 10, active: 1 },
+      { id: 15, name: 'Kuma MySQL', type: 'mysql', databaseConnectionString: 'mysql://user:pass@10.0.0.9:3306/lp', interval: 60, active: 1 },
+      { id: 16, name: 'Kuma Docker', type: 'docker', interval: 60, active: 1 },
+      { id: 17, name: 'Kuma Inversé', type: 'http', url: 'https://x.fr', upsideDown: 1, interval: 60, active: 1 },
+    ],
+  };
+  const r = (await call('POST', '/api/import/kuma', backup)).body;
+  assert.strictEqual(r.monitors, 5);
+  assert.strictEqual(r.notifications, 1);
+  assert.strictEqual(r.skipped.length, 3); // matrix, docker, inversé
+  const ms = (await call('GET', '/api/monitors')).body;
+  const site = ms.find((m) => m.name === 'Kuma Site');
+  assert.strictEqual(site.group, 'Jeux');
+  assert.strictEqual(site.config.retries, 2);
+  assert.strictEqual(site.config.notificationIds.length, 1);
+  assert.strictEqual(ms.find((m) => m.name === 'Kuma MC').type, 'minecraft');
+  const sql = ms.find((m) => m.name === 'Kuma MySQL');
+  assert.strictEqual(sql.config.dbKind, 'mysql'); assert.strictEqual(sql.config.hostname, '10.0.0.9'); assert.strictEqual(sql.config.port, 3306);
+  assert.strictEqual(ms.find((m) => m.name === 'Kuma Port').config.port, 25577);
+  assert.strictEqual((await call('POST', '/api/import/kuma', { foo: 1 })).status, 400);
 });
